@@ -96,6 +96,88 @@ COMMON_STOPWORDS = {
     "were",
     "with",
 }
+INLINE_BOILERPLATE_PATTERNS = (
+    r"\bskip to (?:main )?content\b",
+    r"\bcookie(?: policy| settings| consent)?\b",
+    r"\bprivacy policy\b",
+    r"\bterms(?: of use| and conditions| of service)?\b",
+    r"\bsign in\b",
+    r"\blog in\b",
+    r"\badvanced search\b",
+    r"\ball rights reserved\b",
+)
+NAVIGATION_TERMS = {
+    "home",
+    "about",
+    "submit",
+    "alerts",
+    "rss",
+    "menu",
+    "navigation",
+    "search",
+    "subscribe",
+    "signin",
+    "login",
+    "privacy",
+    "terms",
+    "cookie",
+}
+PROSE_HINT_TERMS = {
+    "analyzes",
+    "analysis",
+    "compares",
+    "compare",
+    "describes",
+    "discusses",
+    "examines",
+    "explains",
+    "finds",
+    "found",
+    "includes",
+    "indicates",
+    "measures",
+    "plots",
+    "ranks",
+    "reports",
+    "shows",
+    "suggests",
+    "tracks",
+}
+INCOMPLETE_TRAILING_TERMS = {
+    "a",
+    "an",
+    "and",
+    "as",
+    "at",
+    "because",
+    "but",
+    "by",
+    "for",
+    "from",
+    "if",
+    "in",
+    "into",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "via",
+    "with",
+    "without",
+}
+GENERIC_CONTEXT_TOKENS = {
+    "article",
+    "chart",
+    "data",
+    "figure",
+    "graph",
+    "image",
+    "page",
+    "plot",
+    "report",
+    "study",
+}
 
 
 @dataclass
@@ -881,16 +963,26 @@ def generate_ocr_search_queries(evidence: ImageEvidence) -> List[str]:
     if evidence.likely_title:
         queries.append(f"\"{evidence.likely_title}\"")
 
+    axis_labels = dedupe_preserve_order([label for label in clean_string_list(evidence.axes_labels) if label])
+    axis_phrase = " ".join(axis_labels[:2]).strip()
     entities = " ".join(evidence.key_entities[:3]).strip()
     numbers = " ".join(evidence.numbers_percentages_dates[:3]).strip()
     branding = " ".join(evidence.logos_watermarks_branding[:2]).strip()
 
+    if axis_phrase:
+        queries.append(collapse_whitespace(axis_phrase))
+    if evidence.likely_title and axis_phrase:
+        queries.append(collapse_whitespace(f"\"{evidence.likely_title}\" {axis_phrase}"))
     if entities and numbers:
         queries.append(collapse_whitespace(f"{entities} {numbers}"))
     if entities and branding:
         queries.append(collapse_whitespace(f"{entities} {branding}"))
+    if axis_phrase and entities:
+        queries.append(collapse_whitespace(f"{axis_phrase} {entities}"))
     if evidence.chart_figure_type and entities:
         queries.append(collapse_whitespace(f"{evidence.chart_figure_type} {entities}"))
+    if evidence.chart_figure_type and axis_phrase:
+        queries.append(collapse_whitespace(f"{evidence.chart_figure_type} {axis_phrase}"))
     if branding and evidence.likely_title:
         queries.append(collapse_whitespace(f"{branding} \"{evidence.likely_title}\""))
 
@@ -1024,7 +1116,7 @@ def verify_candidate_pages(
 
         page_title, page_text, image_urls, published_date = page_data
         candidate.page_title = page_title
-        candidate.page_summary_text = page_text[:1000]
+        candidate.page_summary_text = extract_best_article_excerpt(page_text, evidence)
         candidate.published_date = published_date
 
         best_similarity = 0.0
@@ -1244,8 +1336,8 @@ def build_output_json(
     """
 
     winning_candidate = source_decision.get("candidate")
-    likely_context = build_likely_context(evidence)
-    concise_overview = build_concise_overview(evidence, source_decision, likely_context)
+    likely_context = build_likely_context(evidence, candidates, source_decision)
+    concise_overview = build_concise_overview(evidence, candidates, source_decision, likely_context)
 
     source_status = source_decision["status"]
     if source_status == "exact_source_found":
@@ -1313,61 +1405,761 @@ def build_output_json(
     }
 
 
-def build_likely_context(evidence: ImageEvidence) -> str:
-    """
-    Create a cautious context statement grounded in observed evidence.
+def evidence_context_tokens(values: Sequence[str]) -> Set[str]:
+    """Normalize evidence strings into informative lowercase tokens."""
 
-    This is phrased as inference, not fact. The sentence deliberately references the signals used.
-    """
+    tokens: Set[str] = set()
+    for value in values:
+        for token in tokenize(value):
+            if token not in COMMON_STOPWORDS and len(token) > 2:
+                tokens.add(token)
+    return tokens
 
-    observed_signals: List[str] = []
-    if evidence.likely_title:
-        observed_signals.append(f'the apparent title "{evidence.likely_title}"')
-    if evidence.key_entities:
-        observed_signals.append(f"visible entities such as {', '.join(evidence.key_entities[:3])}")
-    if evidence.numbers_percentages_dates:
-        observed_signals.append(
-            f"numbers or dates including {', '.join(evidence.numbers_percentages_dates[:3])}"
-        )
 
-    signal_text = ", ".join(observed_signals)
-    if signal_text:
-        return (
-            f"This likely relates to {summarize_subject(evidence)}, based on {signal_text}."
-        )
-    return f"This likely relates to {summarize_subject(evidence)}, but the available visual evidence is limited."
+def split_into_sentences(text: str) -> List[str]:
+    """Split plain text into sentence-like chunks while preserving order."""
+
+    cleaned = clean_string(text)
+    if not cleaned:
+        return []
+
+    normalized = cleaned.replace("\xa0", " ")
+    normalized = re.sub(r"\s*([|•·])\s*", ". ", normalized)
+    normalized = re.sub(r"([.!?])([A-Z0-9])", r"\1 \2", normalized)
+
+    fragments = re.split(r"(?<=[.!?])\s+", normalized)
+    sentences: List[str] = []
+    for fragment in fragments:
+        sentence = clean_string(fragment.strip(" \t\r\n|"))
+        if not sentence:
+            continue
+        word_count = len(re.findall(r"[A-Za-z0-9]+", sentence))
+        if word_count < 2 and not re.search(r"[.!?]$", sentence):
+            continue
+        sentences.append(sentence)
+    return sentences
+
+
+def looks_like_complete_clause(text: str) -> bool:
+    """Check whether a clause looks readable enough to stand alone."""
+
+    cleaned = clean_string(text).rstrip(",;:")
+    words = re.findall(r"[A-Za-z0-9]+", cleaned.lower())
+    if len(words) < 4:
+        return False
+    if words[0] in {"and", "or", "but", "because", "that", "which", "who"}:
+        return False
+    if words[-1] in INCOMPLETE_TRAILING_TERMS:
+        return False
+    return True
+
+
+def trim_to_complete_clause(text: str, max_chars: int) -> str:
+    """Trim long text to a readable clause ending at punctuation before a hard cut."""
+
+    cleaned = clean_string(text)
+    if not cleaned:
+        return ""
+
+    candidate = cleaned[:max_chars].rstrip()
+    clause_breaks = [match.start() for match in re.finditer(r"[,;:]", candidate)]
+    for position in reversed(clause_breaks):
+        clause = candidate[:position].strip()
+        if not looks_like_complete_clause(clause):
+            continue
+        if clause[-1] not in ".!?":
+            clause += "."
+        return clause
+    return ""
+
+
+def is_boilerplate_sentence(sentence: str) -> bool:
+    """Detect conservative navigation, cookie, and footer-like fragments."""
+
+    cleaned = clean_string(sentence)
+    if not cleaned:
+        return True
+
+    lowered = cleaned.lower()
+    words = re.findall(r"[A-Za-z0-9]+", lowered)
+    word_count = len(words)
+    compact_words = {word for word in words if word}
+
+    if any(re.search(pattern, lowered) for pattern in INLINE_BOILERPLATE_PATTERNS):
+        return True
+    if "copyright" in lowered or "newsletter" in lowered:
+        return True
+
+    navigation_hits = sum(1 for term in NAVIGATION_TERMS if term in compact_words)
+    if navigation_hits >= 2 and word_count <= 14:
+        return True
+    if word_count <= 3 and compact_words and compact_words.issubset(NAVIGATION_TERMS):
+        return True
+    if word_count <= 8 and not re.search(r"[.!?]$", cleaned) and navigation_hits >= 1:
+        return True
+    return False
+
+
+def strip_boilerplate_text(text: str) -> str:
+    """Remove obvious non-article boilerplate while keeping readable prose."""
+
+    cleaned = clean_string(text)
+    if not cleaned:
+        return ""
+
+    stripped = cleaned
+    for pattern in INLINE_BOILERPLATE_PATTERNS:
+        stripped = re.sub(pattern, " ", stripped, flags=re.IGNORECASE)
+    stripped = re.sub(
+        r"\b(?:home|about|submit|alerts?|rss|menu|navigation|search|subscribe|privacy|terms|cookie|sign in|log in)\b"
+        r"(?:\s+\b(?:home|about|submit|alerts?|rss|menu|navigation|search|subscribe|privacy|terms|cookie|sign in|log in)\b){2,}",
+        " ",
+        stripped,
+        flags=re.IGNORECASE,
+    )
+    stripped = collapse_whitespace(stripped)
+
+    sentences = split_into_sentences(stripped)
+    filtered = [sentence for sentence in sentences if not is_boilerplate_sentence(sentence)]
+    if filtered:
+        return " ".join(filtered)
+    return stripped
+
+
+def score_sentence_for_context(sentence: str, evidence: ImageEvidence) -> float:
+    """Rank candidate article sentences against visible image evidence."""
+
+    cleaned = clean_string(sentence)
+    if not cleaned:
+        return -10.0
+    if is_boilerplate_sentence(cleaned):
+        return -10.0
+
+    words = re.findall(r"[A-Za-z0-9]+", cleaned)
+    word_count = len(words)
+    sentence_tokens = {token for token in tokenize(cleaned) if token not in COMMON_STOPWORDS}
+    if not sentence_tokens:
+        return -5.0
+
+    title_tokens = evidence_context_tokens([evidence.likely_title])
+    axis_tokens = evidence_context_tokens(evidence.axes_labels)
+    entity_tokens = evidence_context_tokens(evidence.key_entities)
+    visible_tokens = evidence_context_tokens(evidence.visible_text)
+    branding_tokens = evidence_context_tokens(evidence.logos_watermarks_branding)
+
+    score = 0.0
+    score += 3.5 * len(sentence_tokens & title_tokens)
+    score += 2.5 * len(sentence_tokens & axis_tokens)
+    score += 2.5 * len(sentence_tokens & entity_tokens)
+    score += 1.5 * len(sentence_tokens & visible_tokens)
+    score += 1.0 * len(sentence_tokens & branding_tokens)
+
+    if 8 <= word_count <= 36:
+        score += 1.5
+    elif 5 <= word_count <= 50:
+        score += 0.8
+    elif word_count < 5:
+        score -= 1.5
+    else:
+        score -= 0.4
+
+    if re.search(r"[.!?]$", cleaned):
+        score += 0.4
+    if re.search(r"\b(?:%s)\b" % "|".join(sorted(PROSE_HINT_TERMS)), cleaned.lower()):
+        score += 0.6
+    if any(marker in cleaned for marker in ("|", "»", "•")):
+        score -= 0.8
+
+    return score
+
+
+def extract_best_article_excerpt(
+    page_text: str,
+    evidence: ImageEvidence,
+    max_sentences: int = 3,
+) -> str:
+    """Select a short article-style excerpt that best matches the image evidence."""
+
+    cleaned = strip_boilerplate_text(page_text)
+    sentences = split_into_sentences(cleaned)
+    if not sentences:
+        return trim_to_complete_sentences(cleaned, max_chars=420, max_sentences=max_sentences)
+
+    scored: List[Tuple[float, int, str]] = []
+    fallback_indices: List[int] = []
+    for index, sentence in enumerate(sentences):
+        word_count = len(re.findall(r"[A-Za-z0-9]+", sentence))
+        if word_count >= 6 and not is_boilerplate_sentence(sentence):
+            fallback_indices.append(index)
+        scored.append((score_sentence_for_context(sentence, evidence), index, sentence))
+
+    ranked = sorted(scored, key=lambda item: (-item[0], item[1]))
+    selected_indices = [index for score, index, _ in ranked if score > 0][:max_sentences]
+    if not selected_indices:
+        selected_indices = fallback_indices[:max_sentences]
+    if not selected_indices and scored:
+        selected_indices = [scored[0][1]]
+
+    excerpt = " ".join(sentences[index] for index in sorted(set(selected_indices)))
+    return trim_to_complete_sentences(excerpt, max_chars=420, max_sentences=max_sentences)
+
+
+def trim_to_complete_sentences(text: str, max_chars: int = 320, max_sentences: int = 2) -> str:
+    """Prefer complete sentences over clipped fragments, with hard-trim fallback only when needed."""
+
+    cleaned = clean_string(text)
+    if not cleaned:
+        return ""
+
+    sentences = split_into_sentences(cleaned)
+    if sentences:
+        selected: List[str] = []
+        for sentence in sentences:
+            if len(selected) >= max_sentences:
+                break
+            candidate = " ".join(selected + [sentence]).strip()
+            if selected and len(candidate) > max_chars:
+                break
+            if not selected and len(sentence) > max_chars:
+                break
+            selected.append(sentence)
+        if selected:
+            return " ".join(selected)
+
+        for start_index, sentence in enumerate(sentences[1:], start=1):
+            if len(sentence) > max_chars:
+                continue
+            if len(re.findall(r"[A-Za-z0-9]+", sentence)) < 5:
+                continue
+            selected = [sentence]
+            for follow_sentence in sentences[start_index + 1 :]:
+                if len(selected) >= max_sentences:
+                    break
+                candidate = " ".join(selected + [follow_sentence]).strip()
+                if len(candidate) > max_chars:
+                    break
+                selected.append(follow_sentence)
+            if selected:
+                return " ".join(selected)
+
+        clause = trim_to_complete_clause(sentences[0], max_chars)
+        if clause:
+            return clause
+
+    if len(cleaned) <= max_chars:
+        return cleaned
+    clause = trim_to_complete_clause(cleaned, max_chars)
+    if clause:
+        return clause
+    return cleaned[: max_chars - 3].rsplit(" ", 1)[0].rstrip(",;:-") + "..."
+
+
+def build_likely_context(
+    evidence: ImageEvidence,
+    candidates: Sequence[CandidateSource],
+    source_decision: Dict[str, Any],
+) -> str:
+    """Build a richer article-style context paragraph grounded in image and retrieval evidence."""
+
+    context_candidates = select_grounded_context_candidates(candidates, source_decision)
+    subject_sentence = build_subject_context_sentence(evidence, context_candidates)
+    framing_sentence = build_visual_framing_sentence(evidence)
+    retrieved_sentence = build_retrieved_context_sentence(context_candidates, evidence)
+    discussion_sentence = build_discussion_context_sentence(context_candidates)
+
+    sentences = [sentence for sentence in (
+        subject_sentence,
+        framing_sentence,
+        retrieved_sentence,
+        discussion_sentence,
+    ) if sentence]
+
+    if sentences:
+        return trim_to_complete_sentences(" ".join(sentences[:4]), max_chars=720, max_sentences=4)
+    return trim_to_complete_sentences(
+        f"This likely relates to {summarize_subject(evidence)}, but the available grounded context is limited."
+    )
 
 
 def build_concise_overview(
     evidence: ImageEvidence,
+    candidates: Sequence[CandidateSource],
     source_decision: Dict[str, Any],
     likely_context: str,
 ) -> str:
-    """Build a 3-5 sentence overview grounded strictly in extracted evidence and verification output."""
+    """Build a grounded human-readable overview after evidence extraction and candidate verification."""
 
-    sentences = [truncate_sentence(evidence.visual_description or "A clear visual description could not be extracted.")]
+    return build_grounded_summary(evidence, candidates, source_decision, likely_context)
 
+
+def build_grounded_summary(
+    evidence: ImageEvidence,
+    candidates: Sequence[CandidateSource],
+    source_decision: Dict[str, Any],
+    likely_context: str,
+) -> str:
+    """Build a compact explanatory summary of the image itself."""
+
+    context_candidates = select_grounded_context_candidates(candidates, source_decision)
+    return format_concise_explanatory_summary(
+        evidence,
+        context_candidates,
+        source_decision,
+        likely_context,
+    )
+
+
+def format_summary_line(label: str, text: str, max_chars: int = 260, max_sentences: int = 2) -> str:
+    """Format a labeled explanatory line while preserving readable sentence endings."""
+
+    cleaned = trim_to_complete_sentences(text, max_chars=max_chars, max_sentences=max_sentences)
+    if not cleaned:
+        return ""
+    return f"{label}: {cleaned}"
+
+
+def build_concise_focus_line(
+    evidence: ImageEvidence,
+    candidates: Sequence[CandidateSource],
+) -> str:
+    """Summarize the chart or graphic focus in one grounded line."""
+
+    subject_label = subject_label_from_evidence(evidence, candidates)
+    candidate_topics = ""
+    if candidates:
+        candidate_topics = join_readable_list(extract_candidate_context_terms(candidates[0], evidence))
+
+    if evidence.likely_title:
+        return format_summary_line("Chart focus", f'The clearest visible title is "{evidence.likely_title}".')
+    if candidate_topics:
+        return format_summary_line("Chart focus", f"The retrieved context points to themes such as {candidate_topics}.")
+    if subject_label:
+        return format_summary_line("Chart focus", f"The image appears to center on {subject_label}.")
+    return ""
+
+
+def build_axis_structure_line(evidence: ImageEvidence) -> str:
+    """Explain visible axes, ordering, or other chart structure."""
+
+    axis_labels = dedupe_preserve_order(clean_string_list(evidence.axes_labels))
+    if len(axis_labels) >= 2:
+        return format_summary_line("Axes", f"The chart compares {axis_labels[0]} against {axis_labels[1]}.")
+    if len(axis_labels) == 1:
+        return format_summary_line("Structure", f'One visible organizing label is "{axis_labels[0]}".')
+    if evidence.numbers_percentages_dates:
+        values = join_readable_list(evidence.numbers_percentages_dates[:3])
+        return format_summary_line("Structure", f"The image includes numeric or date-like values such as {values}.")
+    return ""
+
+
+def build_data_types_line(evidence: ImageEvidence) -> str:
+    """Summarize visible categories, legend items, or entities shown in the image."""
+
+    labels = dedupe_preserve_order(
+        clean_string_list(evidence.key_entities)
+        + clean_string_list(evidence.legend_items)
+        + clean_string_list(evidence.units)
+    )
+    if labels:
+        return format_summary_line("Data shown", f"It includes categories or labels such as {join_readable_list(labels[:5])}.")
+    if evidence.visible_text:
+        preview = join_readable_list(evidence.visible_text[:3])
+        return format_summary_line("Visible text", f"The graphic includes labels such as {preview}.")
+    return ""
+
+
+def build_main_takeaway_line(
+    evidence: ImageEvidence,
+    candidates: Sequence[CandidateSource],
+) -> str:
+    """Summarize the clearest visible takeaway from the image."""
+
+    framing_sentence = build_visual_framing_sentence(evidence)
+    if framing_sentence:
+        return format_summary_line("Main takeaway", framing_sentence, max_chars=300, max_sentences=2)
+
+    candidate_takeaway = build_candidate_takeaway_sentence(candidates, evidence)
+    if candidate_takeaway:
+        return format_summary_line("Main takeaway", candidate_takeaway, max_chars=260, max_sentences=1)
+
+    if evidence.visual_description:
+        return format_summary_line("Main takeaway", evidence.visual_description, max_chars=300, max_sentences=2)
+    return ""
+
+
+def build_source_caveat_line(source_decision: Dict[str, Any]) -> str:
+    """Add a source-verification caveat when the source is not fully verified."""
+
+    if source_decision["status"] == "exact_source_found":
+        return ""
+    source_sentence = build_source_status_sentence(source_decision)
+    if not source_sentence:
+        return ""
+    return format_summary_line("Source note", source_sentence, max_chars=300, max_sentences=2)
+
+
+def format_concise_explanatory_summary(
+    evidence: ImageEvidence,
+    candidates: Sequence[CandidateSource],
+    source_decision: Dict[str, Any],
+    likely_context: str,
+) -> str:
+    """Build a structured explanatory summary distinct from the contextual background paragraph."""
+
+    summary_lines = [
+        trim_to_complete_sentences(
+            build_subject_context_sentence(evidence, candidates),
+            max_chars=320,
+            max_sentences=2,
+        ),
+        build_concise_focus_line(evidence, candidates),
+        build_axis_structure_line(evidence),
+        build_data_types_line(evidence),
+        build_main_takeaway_line(evidence, candidates),
+        build_source_caveat_line(source_decision),
+    ]
+
+    lines = dedupe_preserve_order([line for line in summary_lines if line])
+    if len(lines) < 3:
+        fallback_lines = [
+            format_summary_line("Visible signal", build_text_signal_sentence(evidence), max_chars=280, max_sentences=2),
+            format_summary_line("Context", likely_context, max_chars=320, max_sentences=2),
+        ]
+        lines.extend([line for line in fallback_lines if line and line not in lines])
+
+    if lines:
+        return "\n".join(lines[:6])
+    return trim_to_complete_sentences(
+        evidence.visual_description or "A clear grounded overview could not be assembled from the available evidence.",
+        max_chars=320,
+        max_sentences=2,
+    )
+
+
+def select_grounded_context_candidates(
+    candidates: Sequence[CandidateSource],
+    source_decision: Dict[str, Any],
+    limit: int = 3,
+) -> List[CandidateSource]:
+    """Choose the strongest grounded candidates for context and summary synthesis."""
+
+    selected: List[CandidateSource] = []
+    winning_candidate = source_decision.get("candidate")
+    if isinstance(winning_candidate, CandidateSource):
+        selected.append(winning_candidate)
+
+    ranked_candidates = sorted(
+        (
+            candidate
+            for candidate in candidates
+            if candidate not in selected
+        ),
+        key=lambda candidate: (-score_candidate_for_context(candidate), -candidate.best_image_similarity, candidate.url),
+    )
+
+    for candidate in ranked_candidates:
+        context_score = score_candidate_for_context(candidate)
+        if context_score < 2.0:
+            continue
+        selected.append(candidate)
+        if len(selected) == limit:
+            break
+
+    return selected[:limit]
+
+
+def score_candidate_for_context(candidate: CandidateSource) -> float:
+    """Rank candidates for summary context without affecting source verification."""
+
+    summary_text = strip_boilerplate_text(candidate.page_summary_text)
+    snippet = strip_boilerplate_text(candidate.snippet)
+    headline = candidate_headline(candidate)
+
+    score = 0.0
+    if candidate.image_embedded:
+        score += 3.0
+    score += min(candidate.text_overlap, 0.35) * 10.0
+    if summary_text:
+        score += 2.5
+        word_count = len(re.findall(r"[A-Za-z0-9]+", summary_text))
+        if 8 <= word_count <= 80:
+            score += 0.8
+    if headline:
+        score += 1.0
+    if snippet:
+        score += 0.8
+    if not candidate.image_embedded and candidate.text_overlap < 0.08:
+        score -= 1.5
+    if not summary_text and not snippet:
+        score -= 1.0
+    return score
+
+
+def candidate_headline(candidate: CandidateSource) -> str:
+    """Return the best available human-readable headline for a grounded candidate."""
+
+    for value in (candidate.page_title, candidate.title):
+        cleaned = clean_string(value)
+        if cleaned:
+            return cleaned
+    return ""
+
+
+def candidate_context_excerpt(candidate: CandidateSource, limit: int = 240) -> str:
+    """Return the strongest contextual text available from a grounded candidate page."""
+
+    for value in (candidate.page_summary_text, candidate.snippet, candidate.page_title, candidate.title):
+        cleaned = strip_boilerplate_text(clean_string(value))
+        if cleaned:
+            return trim_to_complete_sentences(cleaned, max_chars=limit, max_sentences=2)
+    return ""
+
+
+def join_readable_list(values: Sequence[str]) -> str:
+    """Join short topic labels into readable prose."""
+
+    items = [clean_string(value) for value in values if clean_string(value)]
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return f"{', '.join(items[:-1])}, and {items[-1]}"
+
+
+def extract_candidate_context_terms(
+    candidate: CandidateSource,
+    evidence: ImageEvidence,
+    max_terms: int = 3,
+) -> List[str]:
+    """Extract short grounded topic terms from candidate text fields."""
+
+    fields = [
+        candidate.page_title,
+        candidate.title,
+        candidate.snippet,
+        candidate.page_summary_text,
+    ]
+    evidence_tokens = build_evidence_tokens(evidence)
+    scores: Dict[str, float] = {}
+    first_seen: Dict[str, int] = {}
+    order = 0
+
+    for field in fields:
+        cleaned = strip_boilerplate_text(field)
+        if not cleaned:
+            continue
+        for token in tokenize(cleaned):
+            token = token.lower()
+            if (
+                token in COMMON_STOPWORDS
+                or token in NAVIGATION_TERMS
+                or token in COMMENTARY_HINTS
+                or token in GENERIC_CONTEXT_TOKENS
+                or len(token) < 4
+                or not re.search(r"[a-z]", token)
+                or not re.fullmatch(r"[a-z][a-z0-9'-]*", token)
+            ):
+                continue
+            if token not in first_seen:
+                first_seen[token] = order
+                order += 1
+            scores[token] = scores.get(token, 0.0) + 1.0
+            if token in evidence_tokens:
+                scores[token] += 1.0
+
+    ranked = sorted(scores.items(), key=lambda item: (-item[1], first_seen[item[0]]))
+    return [token for token, _ in ranked[:max_terms]]
+
+
+def summarize_candidate_context(candidate: CandidateSource, evidence: ImageEvidence) -> str:
+    """Synthesize grounded candidate context without pasting excerpt text verbatim."""
+
+    headline = candidate_headline(candidate)
+    topics = join_readable_list(extract_candidate_context_terms(candidate, evidence))
+    if topics and headline:
+        return trim_to_complete_sentences(
+            f'A grounded candidate page titled "{headline}" frames the image as part of a discussion about {topics}.',
+            max_chars=320,
+            max_sentences=1,
+        )
+    if topics:
+        return trim_to_complete_sentences(
+            f"Retrieved candidate evidence suggests the image is discussed in a context related to {topics}.",
+            max_chars=300,
+            max_sentences=1,
+        )
+    if headline:
+        return trim_to_complete_sentences(
+            f'A grounded candidate page titled "{headline}" appears to discuss the same subject as the image.',
+            max_chars=280,
+            max_sentences=1,
+        )
+    excerpt = candidate_context_excerpt(candidate, limit=220)
+    if excerpt:
+        return trim_to_complete_sentences(
+            "Retrieved candidate evidence supports the same general subject area as the image.",
+            max_chars=220,
+            max_sentences=1,
+        )
+    return ""
+
+
+def subject_label_from_evidence(
+    evidence: ImageEvidence,
+    candidates: Sequence[CandidateSource],
+) -> str:
+    """Choose the best grounded subject label for the image."""
+
+    if evidence.likely_title:
+        return clean_string(evidence.likely_title)
+    if evidence.key_entities:
+        return ", ".join(evidence.key_entities[:3])
+    for line in evidence.visible_text:
+        cleaned = clean_string(line)
+        token_count = len(re.findall(r"[A-Za-z0-9]+", cleaned))
+        if 2 <= token_count <= 8:
+            return cleaned
+    for candidate in candidates:
+        headline = candidate_headline(candidate)
+        if headline:
+            return headline
+    return summarize_subject(evidence)
+
+
+def build_subject_context_sentence(
+    evidence: ImageEvidence,
+    candidates: Sequence[CandidateSource],
+) -> str:
+    """Describe what the image appears to be about using the strongest available subject signals."""
+
+    subject_label = subject_label_from_evidence(evidence, candidates)
+    chart_type = clean_string(evidence.chart_figure_type)
+    if evidence.likely_title and chart_type and chart_type.lower() != "unknown":
+        return trim_to_complete_sentences(f'This image appears to be a {chart_type} titled "{subject_label}".')
+    if evidence.likely_title:
+        return trim_to_complete_sentences(f'This image appears to center on "{subject_label}".')
+    if chart_type and chart_type.lower() != "unknown":
+        return trim_to_complete_sentences(f"This image appears to be a {chart_type} about {subject_label}.")
+    if subject_label:
+        return trim_to_complete_sentences(f"This image appears to relate to {subject_label}.")
+    return ""
+
+
+def build_visual_framing_sentence(evidence: ImageEvidence) -> str:
+    """Describe what the chart or image appears to be communicating from visible labels and entities."""
+
+    axis_labels = dedupe_preserve_order(clean_string_list(evidence.axes_labels))
+    if len(axis_labels) >= 2:
+        sentence = f"The visible framing suggests it is comparing {axis_labels[0]} against {axis_labels[1]}."
+        if evidence.key_entities:
+            sentence += f" The labeled items point to topics such as {', '.join(evidence.key_entities[:3])}."
+        return trim_to_complete_sentences(sentence, max_chars=300, max_sentences=2)
+    if len(axis_labels) == 1:
+        return trim_to_complete_sentences(
+            f"The visible labeling suggests the image is organized around {axis_labels[0]}."
+        )
+    if evidence.key_entities:
+        return trim_to_complete_sentences(
+            f"The visible labels and text suggest it is explaining or comparing topics such as {', '.join(evidence.key_entities[:3])}."
+        )
+    if evidence.visible_text:
+        preview = "; ".join(evidence.visible_text[:2])
+        return trim_to_complete_sentences(
+            f'Visible text suggests a labeled comparison or discussion that includes "{preview}".',
+            max_chars=300,
+        )
+    return ""
+
+
+def build_retrieved_context_sentence(
+    candidates: Sequence[CandidateSource],
+    evidence: ImageEvidence,
+) -> str:
+    """Add grounded page context from the strongest verified candidate pages."""
+
+    if not candidates:
+        return ""
+
+    anchor = candidates[0]
+    return summarize_candidate_context(anchor, evidence)
+
+
+def build_discussion_context_sentence(candidates: Sequence[CandidateSource]) -> str:
+    """Describe where the image appears to be shared or discussed when grounded candidates support it."""
+
+    discussion_domains = dedupe_preserve_order(
+        [
+            urlparse(candidate.url).netloc.lower().removeprefix("www.")
+            for candidate in candidates
+            if candidate.result_role in {"commentary", "repost"}
+        ]
+    )
+    if discussion_domains:
+        preview = ", ".join(discussion_domains[:3])
+        return trim_to_complete_sentences(
+            f"Additional grounded candidates suggest the image is also being shared or discussed in commentary-oriented settings such as {preview}."
+        )
+    return ""
+
+
+def build_text_signal_sentence(evidence: ImageEvidence) -> str:
+    """Surface the strongest visible-text or title signal without collapsing into a visual caption."""
+
+    if evidence.likely_title:
+        return trim_to_complete_sentences(f'The strongest visible title signal is "{evidence.likely_title}".')
     if evidence.visible_text:
         text_preview = "; ".join(evidence.visible_text[:3])
-        sentences.append(f'Visible text includes: "{text_preview}".')
-    else:
-        sentences.append("No reliable visible text was extracted from the image.")
+        return trim_to_complete_sentences(
+            f'Visible labels and text include "{text_preview}".',
+            max_chars=300,
+        )
+    return ""
 
-    sentences.append(likely_context)
+
+def build_candidate_takeaway_sentence(
+    candidates: Sequence[CandidateSource],
+    evidence: ImageEvidence,
+) -> str:
+    """Summarize what grounded candidate pages seem to say the image is communicating."""
+
+    if not candidates:
+        return ""
+
+    anchor = candidates[0]
+    topics = join_readable_list(extract_candidate_context_terms(anchor, evidence))
+    if topics:
+        return trim_to_complete_sentences(
+            f"Grounded candidate evidence points to a discussion about {topics}.",
+            max_chars=240,
+            max_sentences=1,
+        )
+    if candidate_headline(anchor):
+        return trim_to_complete_sentences(
+            "Grounded candidate evidence supports the same interpretation of the image.",
+            max_chars=240,
+            max_sentences=1,
+        )
+    return ""
+
+
+def build_source_status_sentence(source_decision: Dict[str, Any]) -> str:
+    """Describe the current source-verification state in summary-friendly prose."""
 
     source_status = source_decision["status"]
     candidate = source_decision.get("candidate")
     if source_status == "source_not_found":
-        sentences.append("Reverse image search and OCR-based web search did not produce a page with a verified matching embedded image.")
-    elif source_status == "reverse_match_found_but_not_page_verified":
-        sentences.append("Reverse image search surfaced candidate pages, but none could be visually verified at the page level.")
-    elif candidate is not None:
-        sentences.append(
-            f'The strongest verified candidate is "{candidate.title}" ({candidate.url}), '
-            f'where the embedded image match was scored as {candidate.best_image_similarity:.2f}.'
+        return "No candidate page was verified as the source through an embedded image match."
+    if source_status == "reverse_match_found_but_not_page_verified":
+        return "Reverse image search surfaced candidate pages, but none was verified at the page level."
+    if isinstance(candidate, CandidateSource):
+        display_title = candidate_headline(candidate) or candidate.url
+        return trim_to_complete_sentences(
+            f'The strongest grounded candidate is "{display_title}", with an embedded-image similarity score of {candidate.best_image_similarity:.2f}.',
+            max_chars=260,
         )
-
-    return " ".join(sentences[:5])
+    return ""
 
 
 def build_reasoning_notes(
@@ -1658,10 +2450,7 @@ def dedupe_join(parts: Sequence[str]) -> str:
 def truncate_sentence(text: str, limit: int = 220) -> str:
     """Trim overly long generated sentences without changing their meaning."""
 
-    cleaned = clean_string(text)
-    if len(cleaned) <= limit:
-        return cleaned
-    return cleaned[: limit - 3].rstrip() + "..."
+    return trim_to_complete_sentences(text, max_chars=limit, max_sentences=1)
 
 
 def main() -> None:
