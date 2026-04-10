@@ -18,9 +18,15 @@
   - `OPENROUTER_API_KEY` for vision-based evidence extraction through OpenRouter
   - `SERPAPI_API_KEY` for reverse image search through SerpApi Google Lens
   - `BRAVE_SEARCH_API_KEY` for OCR-based web search through Brave Search
-  - `GOOGLE_CLOUD_PROJECT` and `TEMP_IMAGE_BUCKET` for temporary GCS uploads when reverse-searching local, base64, or `data:` images
-- Local, base64, and `data:` image inputs now use a private Google Cloud Storage upload plus a short-lived signed URL so they can reuse the same SerpApi Google Lens flow as public URLs.
+  - `GOOGLE_CLOUD_PROJECT`, `TEMP_IMAGE_BUCKET`, and `GOOGLE_APPLICATION_CREDENTIALS` for temporary GCS uploads and signed URLs when reverse-searching local, base64, or `data:` images
+- If you run the pipeline with a local image, base64 image, or `data:` URL, you must configure GCS. The pipeline uploads the image to a private bucket, creates a signed URL, uses that signed URL for SerpApi Google Lens, and then deletes the uploaded object.
+- For local-image reverse search, create a service account in the Google Cloud project, create a JSON key for that service account, download it locally, and export it with `export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account-key.json"`.
 - ADC is used for Google Cloud access through `google-cloud-storage`; no separate GCS API key is required.
+- Strongly recommended OCR setup:
+  - install the Python wrapper with `pip install pytesseract`
+  - install the Tesseract OCR engine itself
+  - on Linux: `sudo apt update` then `sudo apt install tesseract-ocr`
+  - on Windows: install Tesseract OCR and ensure the executable is on `PATH`
 - Install Python dependencies as needed, including `pip install google-cloud-storage`.
 - Run: `python retrieve_image_background.py --image <url|data-url|base64|local-path>`
 - Detailed design and limitations: `RETRIEVE_IMAGE_BACKGROUND_PIPELINE.md`
