@@ -3,6 +3,7 @@ import base64
 import binascii
 import hashlib
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -19,6 +20,7 @@ from PIL import Image, UnidentifiedImageError
 
 
 USER_AGENT = "retrieve-image-background/0.1"
+LOGGER = logging.getLogger("retrieve_image_background")
 REQUEST_TIMEOUT_SECONDS = 20
 MAX_REVERSE_CANDIDATES = 8
 MAX_WEB_CANDIDATES = 10
@@ -131,6 +133,7 @@ class ImageEvidence:
     logos_watermarks_branding: List[str] = field(default_factory=list)
     visual_description: str = ""
     extraction_notes: List[str] = field(default_factory=list)
+    ocr_debug: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -159,6 +162,14 @@ class ReverseImageSearchResult:
     """Stage 2 reverse-search candidates plus structured execution debug details."""
 
     candidates: List[CandidateSource] = field(default_factory=list)
+    debug: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class OcrResult:
+    """Optional OCR output plus structured execution debug details."""
+
+    lines: List[str] = field(default_factory=list)
     debug: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -361,9 +372,10 @@ def extract_image_evidence(loaded_image: LoadedImage, user_query: str) -> ImageE
     """
 
     evidence = ImageEvidence()
-    ocr_lines = run_optional_tesseract_ocr(loaded_image.image_bytes)
-    if ocr_lines:
-        evidence.visible_text = dedupe_preserve_order(ocr_lines)[:MAX_VISIBLE_TEXT_LINES]
+    ocr_result = run_optional_tesseract_ocr(loaded_image.image_bytes)
+    evidence.ocr_debug = ocr_result.debug
+    if ocr_result.lines:
+        evidence.visible_text = dedupe_preserve_order(ocr_result.lines)[:MAX_VISIBLE_TEXT_LINES]
         evidence.extraction_notes.append("Visible text includes optional local OCR output.")
     else:
         evidence.extraction_notes.append("Local OCR unavailable or no readable text was extracted.")
@@ -505,10 +517,11 @@ def merge_evidence(existing: ImageEvidence, parsed: Dict[str, Any]) -> ImageEvid
         logos_watermarks_branding=clean_string_list(parsed.get("logos_watermarks_branding")),
         visual_description=clean_string(parsed.get("visual_description", "")) or existing.visual_description,
         extraction_notes=list(existing.extraction_notes),
+        ocr_debug=dict(existing.ocr_debug),
     )
 
 
-def run_optional_tesseract_ocr(image_bytes: bytes) -> List[str]:
+def run_optional_tesseract_ocr(image_bytes: bytes) -> OcrResult:
     """
     Optional OCR fallback used inside Stage 1.
 
@@ -516,19 +529,49 @@ def run_optional_tesseract_ocr(image_bytes: bytes) -> List[str]:
     returns an empty OCR result instead of failing.
     """
 
+    debug: Dict[str, Any] = {
+        "attempted": False,
+        "dependency_available": False,
+        "image_opened": False,
+        "succeeded": False,
+        "engine": "pytesseract",
+        "config": "--psm 6",
+        "preprocess": "grayscale",
+        "early_return_reason": None,
+        "error": None,
+        "line_count": 0,
+    }
+
     try:
         import pytesseract  # type: ignore
     except ImportError:
-        return []
+        debug["early_return_reason"] = "pytesseract_not_installed"
+        LOGGER.info("OCR skipped because pytesseract is not installed.")
+        return OcrResult(debug=debug)
 
     try:
+        debug["dependency_available"] = True
+        debug["attempted"] = True
         with Image.open(BytesIO(image_bytes)) as image:
-            raw_text = pytesseract.image_to_string(image)
-    except Exception:  # noqa: BLE001
-        return []
+            debug["image_opened"] = True
+            image = image.convert("L")
+            raw_text = pytesseract.image_to_string(image, config="--psm 6")
+    except Exception as exc:  # noqa: BLE001
+        debug["early_return_reason"] = "ocr_execution_failed"
+        debug["error"] = f"{type(exc).__name__}: {exc}"
+        LOGGER.warning("OCR execution failed: %s", debug["error"])
+        return OcrResult(debug=debug)
 
     lines = [collapse_whitespace(line) for line in raw_text.splitlines()]
-    return [line for line in lines if line]
+    lines = [line for line in lines if line]
+    debug["succeeded"] = True
+    debug["line_count"] = len(lines)
+
+    if not lines:
+        debug["early_return_reason"] = "no_readable_text_extracted"
+        LOGGER.info("OCR completed but did not extract readable text.")
+
+    return OcrResult(lines=lines, debug=debug)
 
 
 def reverse_image_search(loaded_image: LoadedImage) -> ReverseImageSearchResult:
@@ -1230,6 +1273,7 @@ def build_output_json(
         "confidence": round(float(source_decision["confidence"]), 2),
         "debug_info": {
             "generated_queries": list(search_queries),
+            "ocr": evidence.ocr_debug,
             "reverse_image_search": reverse_search_debug,
             "reasoning_notes": dedupe_join(
                 evidence.extraction_notes
@@ -1592,6 +1636,12 @@ def truncate_sentence(text: str, limit: int = 220) -> str:
 
 def main() -> None:
     """CLI entrypoint for local runs or agent pipelines."""
+
+    log_level_name = os.getenv("RETRIEVE_IMAGE_BACKGROUND_LOG_LEVEL", "WARNING").upper()
+    logging.basicConfig(
+        level=getattr(logging, log_level_name, logging.WARNING),
+        format="%(levelname)s %(name)s: %(message)s",
+    )
 
     parser = argparse.ArgumentParser(description="Retrieve grounded background and source evidence for an image.")
     parser.add_argument("--image", required=True, help="Image input as URL, data URL, base64, or local path.")
