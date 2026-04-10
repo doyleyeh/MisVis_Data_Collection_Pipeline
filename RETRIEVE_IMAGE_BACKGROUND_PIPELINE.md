@@ -16,7 +16,7 @@ The design goal is not generic image captioning. It is evidence-first retrieval 
    - labels, legend items, units
    - entities, numbers, dates, branding
    - short neutral visual description
-3. Run reverse image search when a public image URL and `SERPAPI_API_KEY` are available.
+3. Run reverse image search when `SERPAPI_API_KEY` is available and the pipeline can obtain a reachable image URL. Public URLs are used directly; local, base64, and `data:` inputs are uploaded to a private GCS bucket and exposed through a short-lived signed URL.
 4. Generate OCR-informed web queries, prioritizing extracted visible text from the image.
 5. Run Brave web search for those queries and collect candidate pages.
 6. Fetch candidate pages, parse embedded image URLs, and compare candidate page images to the input image using perceptual hashing.
@@ -51,7 +51,14 @@ This stage gathers candidate pages from reverse image search.
 Current implementation:
 - Uses SerpApi Google Lens when:
   - `SERPAPI_API_KEY` is set
-  - the input image is already a public URL
+  - the input image is already public, or the pipeline can create a temporary signed URL through Google Cloud Storage
+
+For non-public image inputs:
+- the image is uploaded to the private bucket named by `TEMP_IMAGE_BUCKET`
+- the object name is deterministic: `reverse-search/<sha256>.<ext>`
+- a short-lived signed URL is generated with ADC through `google-cloud-storage`
+- that signed URL is sent to SerpApi Google Lens
+- the uploaded object is deleted afterward with `try/finally`
 
 Collected fields per candidate:
 - URL
@@ -63,9 +70,10 @@ Why this stage is needed:
 - Reverse image search is the fastest path to visually similar hosting pages.
 - It is especially valuable when visible OCR text is sparse or absent.
 
-Important limitation:
-- Reverse image search is skipped for local files, base64 strings, and `data:` URLs unless the caller first makes the image publicly reachable.
-- The pipeline continues rather than fabricating a reverse-search result.
+Failure behavior:
+- If GCS upload or signed URL generation fails, reverse image search is skipped gracefully.
+- If SerpApi fails, reverse image search returns no candidates.
+- The rest of the pipeline still runs rather than fabricating a reverse-search result.
 
 ### Stage 3: OCR-Based Web Search
 
@@ -106,6 +114,8 @@ For each candidate page, the tool:
 5. Compares them to the input image hash.
 6. Scores text overlap between page text and extracted image evidence.
 
+Invalid downloaded candidate images are skipped safely. A bad `Content-Type` header or undecodable image payload cannot crash the pipeline.
+
 Decision priorities:
 - Visual similarity is the primary gate.
 - Text overlap cannot produce a source claim by itself.
@@ -120,6 +130,7 @@ Thresholds used:
 Decision outputs:
 - `exact_source_found`
 - `possible_source`
+- `reverse_match_found_but_not_page_verified`
 - `source_not_found`
 
 The tool prefers:
@@ -159,6 +170,7 @@ Why this stage is needed:
 ### Optional Python Libraries
 
 - `pytesseract`
+- `google-cloud-storage`
 
 ### External APIs
 
@@ -180,6 +192,102 @@ Used for:
 
 Environment variable:
 - `SERPAPI_API_KEY`
+
+#### Google Cloud Storage
+
+Used for:
+- Stage 2 temporary uploads for local file paths, raw base64 inputs, and `data:` URLs
+
+Environment variables:
+- `GOOGLE_CLOUD_PROJECT`
+- `TEMP_IMAGE_BUCKET`
+
+Authentication:
+- ADC is used through `google-cloud-storage`
+- no separate GCS API key is needed
+
+## Google Cloud Setup for Local Reverse Search
+
+This feature exists because SerpApi Google Lens needs a reachable image URL. Local files, base64 strings, and `data:` URLs do not have one, so the pipeline temporarily uploads those inputs to a private GCS bucket, signs a short-lived URL, uses that URL for reverse image search, and then deletes the object.
+
+### 1. Create or Use a Google Cloud Account
+
+- Sign in with an existing Google account or create one at Google Cloud.
+- If the account is new to Google Cloud, complete the initial account setup in the Cloud Console.
+
+### 2. Create a Project and Enable Billing
+
+- Create a new Google Cloud project in the Cloud Console, or pick an existing one dedicated to this pipeline.
+- Enable billing for that project because Cloud Storage and signed-URL access depend on an active billable project.
+
+### 3. Enable the Cloud Storage API
+
+- In the Cloud Console for the selected project, enable the Cloud Storage API before using the bucket from local development.
+
+### 4. Install and Initialize the Google Cloud CLI Locally
+
+Install the Google Cloud CLI for your operating system, then run:
+
+```bash
+gcloud init
+gcloud auth application-default login
+```
+
+Notes:
+- `gcloud init` selects the active account and project for local development.
+- `gcloud auth application-default login` creates the ADC credentials used by `google-cloud-storage`.
+- No custom GCS API key is required for this pipeline.
+
+### 5. Create a Bucket for Temporary Reverse-Search Uploads
+
+Recommended bucket settings:
+- private bucket
+- Region location type
+- Standard storage class
+- Uniform access control enabled
+- Public access prevention set to ON
+- Google-managed encryption
+- object versioning disabled
+- no retention lock
+
+Soft delete considerations:
+- If soft delete is enabled in your org, deleted temporary objects may remain recoverable for a period and still count toward storage usage.
+- For a pure temporary-upload bucket, review soft delete retention carefully so cleanup behavior matches your cost and recovery requirements.
+
+### 6. Install the Python Dependency
+
+```bash
+pip install google-cloud-storage
+```
+
+### 7. Configure Environment Variables
+
+```bash
+export GOOGLE_CLOUD_PROJECT="your-gcp-project-id"
+export TEMP_IMAGE_BUCKET="your-private-temp-bucket"
+export SERPAPI_API_KEY="..."
+```
+
+`GOOGLE_CLOUD_PROJECT` selects the project used by ADC-backed `google-cloud-storage`.
+
+`TEMP_IMAGE_BUCKET` is the private bucket that stores temporary reverse-search uploads.
+
+## Runtime Flow for Local Images
+
+1. The pipeline loads the local file, base64 input, or `data:` URL into memory.
+2. If the image already has a public URL, that URL is reused and no GCS upload occurs.
+3. Otherwise, the image is uploaded to `gs://$TEMP_IMAGE_BUCKET/reverse-search/<sha256>.<ext>`.
+4. A short-lived signed URL is generated through ADC.
+5. The signed URL is sent to SerpApi Google Lens.
+6. The uploaded object is deleted afterward, even if reverse image search fails.
+
+## Failure Behavior
+
+- If `google-cloud-storage` is not installed, reverse image search for local images is skipped gracefully.
+- If `GOOGLE_CLOUD_PROJECT` or `TEMP_IMAGE_BUCKET` is missing, reverse image search for local images is skipped gracefully.
+- If GCS upload or signed URL generation fails, reverse image search is skipped gracefully.
+- If a candidate page returns invalid image bytes, that candidate image is skipped safely during verification.
+- None of these failures should crash the full retrieval pipeline.
 
 #### Brave Search API
 
@@ -228,7 +336,16 @@ The tool returns:
       "notes": ""
     }
   ],
-  "source_status": "exact_source_found | possible_source | source_not_found",
+  "raw_reverse_image_candidates": [
+    {
+      "url": "",
+      "title": "",
+      "snippet": "",
+      "result_role": "original source | commentary | repost",
+      "notes": ""
+    }
+  ],
+  "source_status": "exact_source_found | possible_source | reverse_match_found_but_not_page_verified | source_not_found",
   "most_likely_source": null,
   "source_link": null,
   "source_evidence": "",
@@ -238,6 +355,7 @@ The tool returns:
   "confidence": 0.0,
   "debug_info": {
     "generated_queries": [],
+    "reverse_image_search": {},
     "reasoning_notes": ""
   }
 }
@@ -246,6 +364,9 @@ The tool returns:
 Field notes:
 - `most_likely_source` is the candidate title when a source is found, otherwise `null`.
 - `source_link` is only populated for `exact_source_found` and `possible_source`.
+- `raw_reverse_image_candidates` preserves unverified Google Lens hits even if Stage 4 cannot confirm a page-level embedded image match.
+- `reverse_match_found_but_not_page_verified` means reverse image search surfaced candidate pages, but none passed page-level verification.
+- `debug_info.reverse_image_search` exposes why Stage 2 was skipped or failed, including GCS signed-URL setup failures.
 - `source_evidence` begins with the required source assessment sentence, then adds the verification rationale.
 
 ## Failure Cases, Uncertainty Handling, and Limitations
@@ -256,14 +377,16 @@ Field notes:
   - image description and higher-level visual extraction may be unavailable
 - SerpApi unavailable:
   - reverse image search returns no candidates
+- GCS upload or signed URL generation unavailable:
+  - reverse image search for non-public image inputs returns no candidates
 - Brave Search unavailable:
   - OCR web search returns no candidates
 - page fetch blocked:
   - candidate remains listed, but cannot be promoted to verified source
 - client-rendered pages:
   - if the image is injected only after JavaScript runs, static HTML verification may miss it
-- non-public image input:
-  - reverse image search cannot run without a publicly reachable image URL
+- invalid downloaded candidate image:
+  - that image is skipped rather than crashing Stage 4 verification
 
 ### Uncertainty Handling
 
@@ -277,10 +400,10 @@ Field notes:
 - Perceptual hashing is strong for exact and near-exact copies, but it can miss aggressive crops or edits.
 - Without a browser renderer, some dynamic sites cannot be fully verified.
 - The implementation currently uses one provider per search role rather than provider fallbacks.
+- Temporary local-image reverse search depends on working ADC, Cloud Storage access, and a bucket configuration that allows upload plus signed URL generation.
 
 ## Suggested Future Improvements
 
-- Add an image uploader adapter so local/base64 inputs can also run reverse image search.
 - Add browser-based rendering for pages that lazy-load or client-render images.
 - Support multiple search providers with a clean backend interface.
 - Add crop-aware or local-feature visual matching for harder near-duplicate cases.
@@ -340,6 +463,8 @@ result = retrieve_image_background(
 
 - `OPENROUTER_API_KEY`: required for vision-based evidence extraction
 - `SERPAPI_API_KEY`: required for reverse image search
+- `GOOGLE_CLOUD_PROJECT`: required for temporary GCS uploads when the input image is not already public
+- `TEMP_IMAGE_BUCKET`: required for temporary GCS uploads when the input image is not already public
 - `BRAVE_SEARCH_API_KEY`: required for OCR-based web search
 - `OPENROUTER_VISION_MODEL`: optional override for the default OpenRouter model
 - `OPENROUTER_BASE_URL`: optional OpenRouter endpoint override
@@ -353,10 +478,12 @@ result = retrieve_image_background(
 The tool returns one JSON object matching the schema described above.
 
 Important output rules:
-- `source_status` is one of `exact_source_found`, `possible_source`, or `source_not_found`
+- `source_status` is one of `exact_source_found`, `possible_source`, `reverse_match_found_but_not_page_verified`, or `source_not_found`
 - `source_link` is only populated for `exact_source_found` and `possible_source`
 - `source_not_found` is returned when no candidate page contains a verified matching embedded image
+- `reverse_match_found_but_not_page_verified` is returned when reverse image search finds raw candidates but Stage 4 cannot verify any page as embedding the same or a near-identical image
 - `candidate_sources` may include search hits that were investigated but not verified as the final source
+- `raw_reverse_image_candidates` always preserves the raw reverse-search hits collected from SerpApi Google Lens
 
 ## Local Usage
 
@@ -374,5 +501,16 @@ Optional environment setup:
 export OPENROUTER_API_KEY="..."
 export SERPAPI_API_KEY="..."
 export BRAVE_SEARCH_API_KEY="..."
+export GOOGLE_CLOUD_PROJECT="your-gcp-project-id"
+export TEMP_IMAGE_BUCKET="your-private-temp-bucket"
 python retrieve_image_background.py --image "https://example.com/chart.png"
+```
+
+Example local-image run after GCS setup:
+
+```bash
+export GOOGLE_CLOUD_PROJECT="your-gcp-project-id"
+export TEMP_IMAGE_BUCKET="your-private-temp-bucket"
+export SERPAPI_API_KEY="..."
+python retrieve_image_background.py --image "reddit/mis_fig/001100_bf839715c06be01d.jpeg"
 ```

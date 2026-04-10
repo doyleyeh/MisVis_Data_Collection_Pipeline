@@ -6,7 +6,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from html.parser import HTMLParser
 from io import BytesIO
 from pathlib import Path
@@ -29,9 +29,10 @@ DEFAULT_OPENROUTER_VISION_MODEL = "google/gemini-3.1-flash-lite-preview"
 SERPAPI_ENDPOINT = "https://serpapi.com/search"
 OPENROUTER_CHAT_COMPLETIONS_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 BRAVE_WEB_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
-EXACT_MATCH_THRESHOLD = 0.98
-NEAR_EXACT_MATCH_THRESHOLD = 0.93
-POSSIBLE_MATCH_THRESHOLD = 0.88
+TEMP_IMAGE_SIGNED_URL_TTL_MINUTES = 15
+EXACT_MATCH_THRESHOLD = 0.85
+NEAR_EXACT_MATCH_THRESHOLD = 0.80
+POSSIBLE_MATCH_THRESHOLD = 0.70
 TEXT_OVERLAP_FOR_POSSIBLE = 0.18
 REPOST_DOMAINS = {
     "reddit.com",
@@ -153,6 +154,14 @@ class CandidateSource:
     page_summary_text: str = ""
 
 
+@dataclass
+class ReverseImageSearchResult:
+    """Stage 2 reverse-search candidates plus structured execution debug details."""
+
+    candidates: List[CandidateSource] = field(default_factory=list)
+    debug: Dict[str, Any] = field(default_factory=dict)
+
+
 class PageParser(HTMLParser):
     """Minimal HTML parser for titles, text, image URLs, and metadata."""
 
@@ -241,19 +250,22 @@ def retrieve_image_background(image: str, user_query: str = "") -> Dict[str, Any
     loaded_image = load_image_input(image)
     evidence = extract_image_evidence(loaded_image, user_query)
 
-    reverse_candidates = reverse_image_search(loaded_image)
+    reverse_search_result = reverse_image_search(loaded_image)
+    reverse_candidates = reverse_search_result.candidates
     search_queries = generate_ocr_search_queries(evidence)
     web_candidates = collect_web_search_candidates(search_queries)
 
     combined_candidates = deduplicate_candidates(reverse_candidates + web_candidates)
     verified_candidates = verify_candidate_pages(loaded_image, evidence, combined_candidates)
-    source_decision = determine_source_decision(verified_candidates)
+    source_decision = determine_source_decision(verified_candidates, reverse_candidates)
 
     return build_output_json(
         evidence=evidence,
         candidates=verified_candidates,
+        raw_reverse_candidates=reverse_candidates,
         source_decision=source_decision,
         search_queries=search_queries,
+        reverse_search_debug=reverse_search_result.debug,
     )
 
 
@@ -519,25 +531,53 @@ def run_optional_tesseract_ocr(image_bytes: bytes) -> List[str]:
     return [line for line in lines if line]
 
 
-def reverse_image_search(loaded_image: LoadedImage) -> List[CandidateSource]:
+def reverse_image_search(loaded_image: LoadedImage) -> ReverseImageSearchResult:
     """
     Stage 2: collect candidate pages from reverse image search.
 
-    SerpApi Google Lens is used when both `SERPAPI_API_KEY` and a public image URL are available.
-    Reverse image search is intentionally skipped for local/base64-only inputs because Google Lens
-    requires a reachable URL. The pipeline records the limitation and continues.
+    SerpApi Google Lens is used when `SERPAPI_API_KEY` is available and the pipeline can obtain
+    a reachable image URL. Public image inputs keep their existing URL. Local/base64/data inputs
+    are uploaded to a temporary private GCS object, accessed through a short-lived signed URL,
+    and deleted immediately after the reverse search request completes.
     """
 
+    debug: Dict[str, Any] = {
+        "attempted": False,
+        "early_return_reason": None,
+        "url_resolution": {},
+        "serpapi_request": {
+            "attempted": False,
+            "succeeded": False,
+            "error": None,
+        },
+        "cleanup": {
+            "attempted": False,
+            "deleted": False,
+            "reason": None,
+            "error": None,
+        },
+        "raw_candidate_count": 0,
+    }
+
     api_key = os.getenv("SERPAPI_API_KEY", "").strip()
-    if not api_key or not loaded_image.public_url:
-        return []
+    if not api_key:
+        debug["early_return_reason"] = "missing_serpapi_api_key"
+        return ReverseImageSearchResult(debug=debug)
+
+    reverse_search_url, uploaded_object_name, url_resolution_debug = get_reverse_search_url(loaded_image)
+    debug["url_resolution"] = url_resolution_debug
+    if not reverse_search_url:
+        debug["early_return_reason"] = url_resolution_debug.get("early_return_reason") or "reverse_search_url_unavailable"
+        return ReverseImageSearchResult(debug=debug)
 
     params = {
         "engine": "google_lens",
-        "url": loaded_image.public_url,
+        "url": reverse_search_url,
         "api_key": api_key,
     }
 
+    debug["attempted"] = True
+    debug["serpapi_request"]["attempted"] = True
     try:
         response = requests.get(
             SERPAPI_ENDPOINT,
@@ -547,8 +587,15 @@ def reverse_image_search(loaded_image: LoadedImage) -> List[CandidateSource]:
         )
         response.raise_for_status()
         data = response.json()
-    except Exception:  # noqa: BLE001
-        return []
+        debug["serpapi_request"]["succeeded"] = True
+    except Exception as exc:  # noqa: BLE001
+        debug["early_return_reason"] = "serpapi_request_failed"
+        debug["serpapi_request"]["error"] = f"{type(exc).__name__}: {exc}"
+        return ReverseImageSearchResult(debug=debug)
+    finally:
+        # Temporary uploads are only needed long enough for SerpApi to fetch the image URL.
+        if uploaded_object_name:
+            debug["cleanup"] = delete_uploaded_image(uploaded_object_name)
 
     results: List[CandidateSource] = []
     for field_name, result_role, note_prefix in (
@@ -583,7 +630,173 @@ def reverse_image_search(loaded_image: LoadedImage) -> List[CandidateSource]:
                 )
             )
 
-    return results
+    debug["raw_candidate_count"] = len(results)
+    return ReverseImageSearchResult(candidates=results, debug=debug)
+
+
+def mime_type_to_extension(mime_type: str) -> str:
+    """Map common image MIME types to stable filename extensions."""
+
+    normalized = clean_string(mime_type).split(";", 1)[0].lower()
+    if normalized == "image/jpeg":
+        return ".jpg"
+    if normalized == "image/png":
+        return ".png"
+    if normalized == "image/webp":
+        return ".webp"
+    if normalized == "image/gif":
+        return ".gif"
+    if normalized == "image/bmp":
+        return ".bmp"
+    if normalized in {"image/tiff", "image/x-tiff"}:
+        return ".tiff"
+    return ".png"
+
+
+def upload_image_and_get_signed_url(
+    loaded_image: LoadedImage,
+) -> Tuple[Optional[str], Optional[str], Dict[str, Any]]:
+    """
+    Upload a non-public input image to GCS and return a short-lived signed URL plus object name.
+
+    ADC is used through `google-cloud-storage`. Any failure returns `(None, None)` so reverse
+    image search can be skipped without aborting the full pipeline.
+    """
+
+    project = os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
+    bucket_name = os.getenv("TEMP_IMAGE_BUCKET", "").strip()
+    object_name = f"reverse-search/{loaded_image.sha256}{mime_type_to_extension(loaded_image.mime_type)}"
+    debug = {
+        "used_public_url": False,
+        "upload_attempted": False,
+        "upload_succeeded": False,
+        "signed_url_generated": False,
+        "credential_source": None,
+        "credentials_path": os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip() or None,
+        "service_account_email": None,
+        "project": project or None,
+        "bucket": bucket_name or None,
+        "object_name": object_name,
+        "early_return_reason": None,
+        "error": None,
+    }
+
+    if not project or not bucket_name:
+        debug["early_return_reason"] = "missing_google_cloud_project_or_temp_image_bucket"
+        return None, None, debug
+
+    try:
+        from google.cloud import storage
+        from google.oauth2 import service_account
+    except ImportError:
+        debug["early_return_reason"] = "google_cloud_storage_dependency_missing"
+        return None, None, debug
+
+    try:
+        credentials = None
+        credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+        if credentials_path:
+            credentials = service_account.Credentials.from_service_account_file(credentials_path)
+            debug["credential_source"] = "google_application_credentials_service_account"
+            debug["service_account_email"] = getattr(credentials, "service_account_email", None)
+        else:
+            debug["credential_source"] = "adc_default_credentials"
+
+        debug["upload_attempted"] = True
+        client = storage.Client(project=project, credentials=credentials)
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(object_name)
+        blob.upload_from_string(loaded_image.image_bytes, content_type=loaded_image.mime_type)
+        debug["upload_succeeded"] = True
+        signed_url_kwargs: Dict[str, Any] = {
+            "version": "v4",
+            "expiration": timedelta(minutes=TEMP_IMAGE_SIGNED_URL_TTL_MINUTES),
+            "method": "GET",
+        }
+        if credentials is not None:
+            signed_url_kwargs["credentials"] = credentials
+            signed_url_kwargs["service_account_email"] = getattr(credentials, "service_account_email", None)
+        signed_url = blob.generate_signed_url(**signed_url_kwargs)
+        debug["signed_url_generated"] = True
+        return signed_url, object_name, debug
+    except Exception as exc:  # noqa: BLE001
+        debug["early_return_reason"] = (
+            "gcs_signed_url_generation_failed" if debug["upload_succeeded"] else "gcs_upload_failed"
+        )
+        debug["error"] = f"{type(exc).__name__}: {exc}"
+        delete_uploaded_image(object_name)
+        return None, None, debug
+
+
+def delete_uploaded_image(object_name: str) -> Dict[str, Any]:
+    """Best-effort cleanup for temporary reverse-search uploads."""
+
+    debug = {
+        "attempted": False,
+        "deleted": False,
+        "reason": None,
+        "error": None,
+    }
+    project = os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
+    bucket_name = os.getenv("TEMP_IMAGE_BUCKET", "").strip()
+    if not object_name or not project or not bucket_name:
+        debug["reason"] = "missing_cleanup_context"
+        return debug
+
+    try:
+        from google.cloud import storage
+        from google.oauth2 import service_account
+    except ImportError:
+        debug["reason"] = "google_cloud_storage_dependency_missing"
+        return debug
+
+    try:
+        credentials = None
+        credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+        if credentials_path:
+            credentials = service_account.Credentials.from_service_account_file(credentials_path)
+        debug["attempted"] = True
+        client = storage.Client(project=project, credentials=credentials)
+        bucket = client.bucket(bucket_name)
+        bucket.blob(object_name).delete()
+        debug["deleted"] = True
+        debug["reason"] = "deleted"
+        return debug
+    except Exception as exc:  # noqa: BLE001
+        debug["reason"] = "delete_failed"
+        debug["error"] = f"{type(exc).__name__}: {exc}"
+        return debug
+
+
+def get_reverse_search_url(
+    loaded_image: LoadedImage,
+) -> Tuple[Optional[str], Optional[str], Dict[str, Any]]:
+    """
+    Return a URL SerpApi Google Lens can fetch.
+
+    Public inputs preserve existing behavior. Non-public inputs use a temporary signed GCS URL.
+    The returned object name is only set when cleanup is required.
+    """
+
+    debug: Dict[str, Any] = {
+        "resolved": False,
+        "url_source": "public_url" if loaded_image.public_url else "gcs_signed_url",
+        "early_return_reason": None,
+        "gcs": None,
+    }
+
+    if loaded_image.public_url:
+        debug["resolved"] = True
+        return loaded_image.public_url, None, debug
+
+    signed_url, object_name, gcs_debug = upload_image_and_get_signed_url(loaded_image)
+    debug["gcs"] = gcs_debug
+    if not signed_url:
+        debug["early_return_reason"] = gcs_debug.get("early_return_reason") or "gcs_signed_url_unavailable"
+        return None, None, debug
+
+    debug["resolved"] = True
+    return signed_url, object_name, debug
 
 
 def generate_ocr_search_queries(evidence: ImageEvidence) -> List[str]:
@@ -836,7 +1049,10 @@ def fetch_candidate_image(url: str) -> Optional[bytes]:
     return response.content
 
 
-def determine_source_decision(candidates: Sequence[CandidateSource]) -> Dict[str, Any]:
+def determine_source_decision(
+    candidates: Sequence[CandidateSource],
+    raw_reverse_candidates: Sequence[CandidateSource],
+) -> Dict[str, Any]:
     """
     Stage 4 decision logic.
 
@@ -844,7 +1060,20 @@ def determine_source_decision(candidates: Sequence[CandidateSource]) -> Dict[str
     multiple already-visual candidates and cannot produce a source decision by itself.
     """
 
+    had_reverse_matches = bool(raw_reverse_candidates)
+
     if not candidates:
+        if had_reverse_matches:
+            return {
+                "status": "reverse_match_found_but_not_page_verified",
+                "candidate": None,
+                "match_type": "none",
+                "source_evidence": (
+                    "Reverse image search returned candidate pages, but none could be carried through "
+                    "page-level verification."
+                ),
+                "confidence": 0.12,
+            }
         return {
             "status": "source_not_found",
             "candidate": None,
@@ -857,6 +1086,17 @@ def determine_source_decision(candidates: Sequence[CandidateSource]) -> Dict[str
     similarity = best_visual.best_image_similarity
 
     if similarity < POSSIBLE_MATCH_THRESHOLD or not best_visual.image_embedded:
+        if had_reverse_matches:
+            return {
+                "status": "reverse_match_found_but_not_page_verified",
+                "candidate": None,
+                "match_type": "none",
+                "source_evidence": (
+                    "Reverse image search found candidate pages, but Stage 4 did not verify any candidate "
+                    "page as embedding the same or a near-identical image."
+                ),
+                "confidence": 0.2,
+            }
         return {
             "status": "source_not_found",
             "candidate": None,
@@ -919,8 +1159,10 @@ def determine_source_decision(candidates: Sequence[CandidateSource]) -> Dict[str
 def build_output_json(
     evidence: ImageEvidence,
     candidates: Sequence[CandidateSource],
+    raw_reverse_candidates: Sequence[CandidateSource],
     source_decision: Dict[str, Any],
     search_queries: Sequence[str],
+    reverse_search_debug: Dict[str, Any],
 ) -> Dict[str, Any]:
     """
     Stage 5: assemble the final grounded JSON output.
@@ -938,6 +1180,8 @@ def build_output_json(
         source_assessment = "An exact or near-exact source page was found."
     elif source_status == "possible_source":
         source_assessment = "A possible source page was found, but it is not fully verified."
+    elif source_status == "reverse_match_found_but_not_page_verified":
+        source_assessment = "Reverse image search found matches, but no candidate page was visually verified."
     else:
         source_assessment = "No exact matching source page was found."
 
@@ -952,6 +1196,16 @@ def build_output_json(
         }
         for candidate in list(candidates)[:10]
     ]
+    raw_reverse_image_candidates = [
+        {
+            "url": candidate.url,
+            "title": candidate.title,
+            "snippet": candidate.snippet,
+            "result_role": candidate.result_role,
+            "notes": candidate.notes,
+        }
+        for candidate in list(raw_reverse_candidates)[:10]
+    ]
 
     combined_source_evidence = source_assessment
     if source_decision["source_evidence"]:
@@ -965,6 +1219,7 @@ def build_output_json(
         ),
         "image_type": evidence.chart_figure_type or "unknown",
         "candidate_sources": candidate_sources,
+        "raw_reverse_image_candidates": raw_reverse_image_candidates,
         "source_status": source_status,
         "most_likely_source": winning_candidate.title if winning_candidate else None,
         "source_link": winning_candidate.url if winning_candidate else None,
@@ -975,10 +1230,11 @@ def build_output_json(
         "confidence": round(float(source_decision["confidence"]), 2),
         "debug_info": {
             "generated_queries": list(search_queries),
+            "reverse_image_search": reverse_search_debug,
             "reasoning_notes": dedupe_join(
                 evidence.extraction_notes
                 + [source_assessment]
-                + build_reasoning_notes(candidates, source_decision)
+                + build_reasoning_notes(candidates, raw_reverse_candidates, source_decision)
             ),
         },
     }
@@ -1030,6 +1286,8 @@ def build_concise_overview(
     candidate = source_decision.get("candidate")
     if source_status == "source_not_found":
         sentences.append("Reverse image search and OCR-based web search did not produce a page with a verified matching embedded image.")
+    elif source_status == "reverse_match_found_but_not_page_verified":
+        sentences.append("Reverse image search surfaced candidate pages, but none could be visually verified at the page level.")
     elif candidate is not None:
         sentences.append(
             f'The strongest verified candidate is "{candidate.title}" ({candidate.url}), '
@@ -1041,11 +1299,13 @@ def build_concise_overview(
 
 def build_reasoning_notes(
     candidates: Sequence[CandidateSource],
+    raw_reverse_candidates: Sequence[CandidateSource],
     source_decision: Dict[str, Any],
 ) -> List[str]:
     """Summarize search and verification behavior for debugging without exposing chain-of-thought."""
 
     notes = [f"Collected {len(candidates)} deduplicated candidate pages."]
+    notes.append(f"Collected {len(raw_reverse_candidates)} raw reverse-image candidates.")
     if candidates:
         best = max(candidates, key=lambda candidate: candidate.best_image_similarity)
         notes.append(

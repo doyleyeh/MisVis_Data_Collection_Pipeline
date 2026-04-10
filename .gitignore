@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 reddit
 .vscode
+.gcp/*.json
+test_json_output
