@@ -433,13 +433,15 @@ def extract_image_evidence(loaded_image: LoadedImage, user_query: str) -> ImageE
         evidence = merge_evidence(evidence, parsed)
         evidence.extraction_notes.append("Vision extraction completed with a strict JSON schema.")
     except Exception as exc:  # noqa: BLE001
+        error_message = format_exception(exc)
         if not evidence.visual_description:
             evidence.visual_description = (
                 "Visual description unavailable because the vision extraction request failed."
             )
         if not evidence.chart_figure_type:
             evidence.chart_figure_type = "unknown"
-        evidence.extraction_notes.append(f"Vision extraction failed: {exc}")
+        evidence.extraction_notes.append(f"Vision extraction failed: {error_message}")
+        LOGGER.warning("Vision extraction failed: %s", error_message)
 
     return evidence
 
@@ -464,6 +466,12 @@ def build_stage_one_prompt(user_query: str) -> str:
         "- likely_title may be empty if no clear title exists.\n"
         "- chart_figure_type should be specific when visible (for example: bar chart, line chart, infographic, screenshot, map, poster).\n"
     )
+
+
+def format_exception(exc: BaseException) -> str:
+    """Format exceptions consistently for logs and debug payloads."""
+
+    return f"{type(exc).__name__}: {exc}"
 
 
 def evidence_schema() -> Dict[str, Any]:
@@ -544,9 +552,10 @@ def run_optional_tesseract_ocr(image_bytes: bytes) -> OcrResult:
 
     try:
         import pytesseract  # type: ignore
-    except ImportError:
+    except ImportError as exc:
         debug["early_return_reason"] = "pytesseract_not_installed"
-        LOGGER.info("OCR skipped because pytesseract is not installed.")
+        debug["error"] = format_exception(exc)
+        LOGGER.info("OCR skipped because pytesseract is not installed: %s", debug["error"])
         return OcrResult(debug=debug)
 
     try:
@@ -558,7 +567,7 @@ def run_optional_tesseract_ocr(image_bytes: bytes) -> OcrResult:
             raw_text = pytesseract.image_to_string(image, config="--psm 6")
     except Exception as exc:  # noqa: BLE001
         debug["early_return_reason"] = "ocr_execution_failed"
-        debug["error"] = f"{type(exc).__name__}: {exc}"
+        debug["error"] = format_exception(exc)
         LOGGER.warning("OCR execution failed: %s", debug["error"])
         return OcrResult(debug=debug)
 
@@ -633,7 +642,8 @@ def reverse_image_search(loaded_image: LoadedImage) -> ReverseImageSearchResult:
         debug["serpapi_request"]["succeeded"] = True
     except Exception as exc:  # noqa: BLE001
         debug["early_return_reason"] = "serpapi_request_failed"
-        debug["serpapi_request"]["error"] = f"{type(exc).__name__}: {exc}"
+        debug["serpapi_request"]["error"] = format_exception(exc)
+        LOGGER.warning("Reverse image search request failed: %s", debug["serpapi_request"]["error"])
         return ReverseImageSearchResult(debug=debug)
     finally:
         # Temporary uploads are only needed long enough for SerpApi to fetch the image URL.
@@ -731,8 +741,10 @@ def upload_image_and_get_signed_url(
     try:
         from google.cloud import storage
         from google.oauth2 import service_account
-    except ImportError:
+    except ImportError as exc:
         debug["early_return_reason"] = "google_cloud_storage_dependency_missing"
+        debug["error"] = format_exception(exc)
+        LOGGER.warning("GCS dependency import failed during temporary upload: %s", debug["error"])
         return None, None, debug
 
     try:
@@ -766,7 +778,8 @@ def upload_image_and_get_signed_url(
         debug["early_return_reason"] = (
             "gcs_signed_url_generation_failed" if debug["upload_succeeded"] else "gcs_upload_failed"
         )
-        debug["error"] = f"{type(exc).__name__}: {exc}"
+        debug["error"] = format_exception(exc)
+        LOGGER.warning("Temporary GCS upload or signed URL generation failed: %s", debug["error"])
         delete_uploaded_image(object_name)
         return None, None, debug
 
@@ -789,8 +802,10 @@ def delete_uploaded_image(object_name: str) -> Dict[str, Any]:
     try:
         from google.cloud import storage
         from google.oauth2 import service_account
-    except ImportError:
+    except ImportError as exc:
         debug["reason"] = "google_cloud_storage_dependency_missing"
+        debug["error"] = format_exception(exc)
+        LOGGER.warning("GCS dependency import failed during cleanup: %s", debug["error"])
         return debug
 
     try:
@@ -807,7 +822,8 @@ def delete_uploaded_image(object_name: str) -> Dict[str, Any]:
         return debug
     except Exception as exc:  # noqa: BLE001
         debug["reason"] = "delete_failed"
-        debug["error"] = f"{type(exc).__name__}: {exc}"
+        debug["error"] = format_exception(exc)
+        LOGGER.warning("Temporary GCS cleanup failed for %s: %s", object_name, debug["error"])
         return debug
 
 
@@ -918,7 +934,12 @@ def collect_web_search_candidates(queries: Sequence[str]) -> List[CandidateSourc
             )
             response.raise_for_status()
             data = response.json()
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning(
+                'Brave web search request failed for query "%s": %s',
+                query,
+                format_exception(exc),
+            )
             continue
 
         web_section = data.get("web", {})
@@ -1014,7 +1035,13 @@ def verify_candidate_pages(
                 continue
             try:
                 candidate_hash = compute_image_hash(image_bytes)
-            except ValueError:
+            except ValueError as exc:
+                LOGGER.info(
+                    "Skipping undecodable candidate image for %s from %s: %s",
+                    candidate.url,
+                    image_url,
+                    format_exception(exc),
+                )
                 continue
             similarity = phash_similarity(target_hash, candidate_hash)
             if similarity > best_similarity:
@@ -1055,7 +1082,8 @@ def fetch_page_images_and_text(url: str) -> Optional[Tuple[str, str, List[str], 
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("Candidate page fetch failed for %s: %s", url, format_exception(exc))
         return None
 
     content_type = response.headers.get("Content-Type", "")
@@ -1083,7 +1111,8 @@ def fetch_candidate_image(url: str) -> Optional[bytes]:
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("Candidate image fetch failed for %s: %s", url, format_exception(exc))
         return None
 
     content_type = response.headers.get("Content-Type", "").lower()
@@ -1515,7 +1544,8 @@ def normalize_date_candidates(values: Sequence[str]) -> Optional[str]:
         try:
             parsed = datetime.fromisoformat(cleaned.replace("Z", "+00:00"))
             return parsed.date().isoformat()
-        except ValueError:
+        except ValueError as exc:
+            LOGGER.debug("Could not parse meta date '%s' as ISO datetime: %s", cleaned, format_exception(exc))
             match = re.search(r"\d{4}-\d{2}-\d{2}", cleaned)
             if match:
                 return match.group(0)
