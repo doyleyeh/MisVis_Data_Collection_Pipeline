@@ -15,7 +15,7 @@ from urllib.parse import urljoin, urlparse
 
 import imagehash
 import requests
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 
 USER_AGENT = "retrieve-image-background/0.1"
@@ -756,7 +756,11 @@ def verify_candidate_pages(
             image_bytes = fetch_candidate_image(image_url)
             if not image_bytes:
                 continue
-            similarity = phash_similarity(target_hash, compute_image_hash(image_bytes))
+            try:
+                candidate_hash = compute_image_hash(image_bytes)
+            except ValueError:
+                continue
+            similarity = phash_similarity(target_hash, candidate_hash)
             if similarity > best_similarity:
                 best_similarity = similarity
                 best_image_url = image_url
@@ -1141,8 +1145,11 @@ def text_overlap_score(evidence_tokens: Set[str], page_text: str) -> float:
 def compute_image_hash(image_bytes: bytes) -> imagehash.ImageHash:
     """Compute perceptual hash for visual matching."""
 
-    with Image.open(BytesIO(image_bytes)) as image:
-        return imagehash.phash(image.convert("RGB"))
+    try:
+        with Image.open(BytesIO(image_bytes)) as image:
+            return imagehash.phash(image.convert("RGB"))
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise ValueError("Image bytes are not a decodable raster image.") from exc
 
 
 def phash_similarity(hash_a: imagehash.ImageHash, hash_b: imagehash.ImageHash) -> float:
