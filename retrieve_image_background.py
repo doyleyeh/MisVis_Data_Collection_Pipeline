@@ -28,10 +28,12 @@ MAX_PAGE_IMAGES = 12
 MAX_VISIBLE_TEXT_LINES = 20
 MAX_QUERY_COUNT = 5
 DEFAULT_OPENROUTER_VISION_MODEL = "google/gemini-3.1-flash-lite-preview"
+DEFAULT_OPENROUTER_SUMMARY_MODEL = "google/gemini-3.1-flash-lite-preview"
 SERPAPI_ENDPOINT = "https://serpapi.com/search"
 OPENROUTER_CHAT_COMPLETIONS_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 BRAVE_WEB_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
 TEMP_IMAGE_SIGNED_URL_TTL_MINUTES = 15
+DEFAULT_LLM_SUMMARY_TIMEOUT_SECONDS = 20
 EXACT_MATCH_THRESHOLD = 0.85
 NEAR_EXACT_MATCH_THRESHOLD = 0.80
 POSSIBLE_MATCH_THRESHOLD = 0.70
@@ -255,6 +257,18 @@ class OcrResult:
     debug: Dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class LlmSummaryConfig:
+    """Optional explicit overrides for the env-based LLM summary settings."""
+
+    enable_llm_context_summary: Optional[bool] = None
+    page_summary_enabled: Optional[bool] = None
+    likely_context_enabled: Optional[bool] = None
+    concise_overview_enabled: Optional[bool] = None
+    summary_model: Optional[str] = None
+    timeout_seconds: Optional[int] = None
+
+
 class PageParser(HTMLParser):
     """Minimal HTML parser for titles, text, image URLs, and metadata."""
 
@@ -327,7 +341,11 @@ class PageParser(HTMLParser):
         self.text_chunks.append(cleaned)
 
 
-def retrieve_image_background(image: str, user_query: str = "") -> Dict[str, Any]:
+def retrieve_image_background(
+    image: str,
+    user_query: str = "",
+    llm_summary_config: Optional[LlmSummaryConfig] = None,
+) -> Dict[str, Any]:
     """
     Run the full multimodal retrieval pipeline and return the strict JSON payload.
 
@@ -342,6 +360,7 @@ def retrieve_image_background(image: str, user_query: str = "") -> Dict[str, Any
 
     loaded_image = load_image_input(image)
     evidence = extract_image_evidence(loaded_image, user_query)
+    llm_summary_debug = initialize_llm_summary_debug(llm_summary_config=llm_summary_config)
 
     reverse_search_result = reverse_image_search(loaded_image)
     reverse_candidates = reverse_search_result.candidates
@@ -349,7 +368,13 @@ def retrieve_image_background(image: str, user_query: str = "") -> Dict[str, Any
     web_candidates = collect_web_search_candidates(search_queries)
 
     combined_candidates = deduplicate_candidates(reverse_candidates + web_candidates)
-    verified_candidates = verify_candidate_pages(loaded_image, evidence, combined_candidates)
+    verified_candidates = verify_candidate_pages(
+        loaded_image,
+        evidence,
+        combined_candidates,
+        llm_summary_debug=llm_summary_debug,
+        llm_summary_config=llm_summary_config,
+    )
     source_decision = determine_source_decision(verified_candidates, reverse_candidates)
 
     return build_output_json(
@@ -359,6 +384,8 @@ def retrieve_image_background(image: str, user_query: str = "") -> Dict[str, Any
         source_decision=source_decision,
         search_queries=search_queries,
         reverse_search_debug=reverse_search_result.debug,
+        llm_summary_debug=llm_summary_debug,
+        llm_summary_config=llm_summary_config,
     )
 
 
@@ -554,6 +581,263 @@ def format_exception(exc: BaseException) -> str:
     """Format exceptions consistently for logs and debug payloads."""
 
     return f"{type(exc).__name__}: {exc}"
+
+
+def env_flag_enabled(name: str, default: bool = False) -> bool:
+    """Parse common boolean environment-variable strings."""
+
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def resolve_bool_override(
+    explicit_override: Optional[bool],
+    env_name: str,
+    default: bool,
+) -> bool:
+    """Resolve booleans with explicit override first, then env, then default."""
+
+    if explicit_override is not None:
+        return explicit_override
+    return env_flag_enabled(env_name, default=default)
+
+
+def resolve_string_override(
+    explicit_override: Optional[str],
+    env_name: str,
+    default: str,
+) -> str:
+    """Resolve strings with explicit override first, then env, then default."""
+
+    if explicit_override is not None and explicit_override.strip():
+        return explicit_override.strip()
+    return os.getenv(env_name, default).strip() or default
+
+
+def resolve_int_override(
+    explicit_override: Optional[int],
+    env_name: str,
+    default: int,
+    minimum: int = 1,
+) -> int:
+    """Resolve integers with explicit override first, then env, then default."""
+
+    if explicit_override is not None:
+        return max(minimum, int(explicit_override))
+    raw_value = os.getenv(env_name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        return max(minimum, int(float(raw_value)))
+    except ValueError:
+        return default
+
+
+def llm_summary_timeout_seconds(llm_summary_config: Optional[LlmSummaryConfig] = None) -> int:
+    """Return the configured timeout for optional summary rewrites."""
+
+    return resolve_int_override(
+        llm_summary_config.timeout_seconds if llm_summary_config else None,
+        "LLM_SUMMARY_TIMEOUT_SECONDS",
+        DEFAULT_LLM_SUMMARY_TIMEOUT_SECONDS,
+        minimum=5,
+    )
+
+
+def llm_summary_model_name(llm_summary_config: Optional[LlmSummaryConfig] = None) -> str:
+    """Return the configured OpenRouter model for optional summary rewrites."""
+
+    return resolve_string_override(
+        llm_summary_config.summary_model if llm_summary_config else None,
+        "OPENROUTER_SUMMARY_MODEL",
+        DEFAULT_OPENROUTER_SUMMARY_MODEL,
+    )
+
+
+def llm_context_summary_enabled(
+    scope: Optional[str] = None,
+    llm_summary_config: Optional[LlmSummaryConfig] = None,
+) -> bool:
+    """Return whether optional LLM-assisted summary rewriting is enabled."""
+
+    # Env is the baseline config; explicit overrides take precedence.
+    if not resolve_bool_override(
+        llm_summary_config.enable_llm_context_summary if llm_summary_config else None,
+        "ENABLE_LLM_CONTEXT_SUMMARY",
+        False,
+    ):
+        return False
+    if not os.getenv("OPENROUTER_API_KEY", "").strip():
+        return False
+
+    if not scope:
+        return True
+
+    # The global flag still gates all scoped flags.
+    scoped_settings = {
+        "page_summary": (
+            llm_summary_config.page_summary_enabled if llm_summary_config else None,
+            "LLM_PAGE_SUMMARY_ENABLED",
+        ),
+        "likely_context": (
+            llm_summary_config.likely_context_enabled if llm_summary_config else None,
+            "LLM_LIKELY_CONTEXT_ENABLED",
+        ),
+        "concise_overview": (
+            llm_summary_config.concise_overview_enabled if llm_summary_config else None,
+            "LLM_CONCISE_OVERVIEW_ENABLED",
+        ),
+    }
+    explicit_override, env_name = scoped_settings.get(scope, (None, ""))
+    if not env_name:
+        return True
+    return resolve_bool_override(explicit_override, env_name, True)
+
+
+def initialize_llm_summary_debug(llm_summary_config: Optional[LlmSummaryConfig] = None) -> Dict[str, Any]:
+    """Create safe debug metadata for optional summary rewriting."""
+
+    requested = resolve_bool_override(
+        llm_summary_config.enable_llm_context_summary if llm_summary_config else None,
+        "ENABLE_LLM_CONTEXT_SUMMARY",
+        False,
+    )
+    api_key_present = bool(os.getenv("OPENROUTER_API_KEY", "").strip())
+    enabled = requested and api_key_present
+    return {
+        "requested": requested,
+        "enabled": enabled,
+        "api_key_present": api_key_present,
+        "model": llm_summary_model_name(llm_summary_config),
+        "page_summary": {
+            "enabled": llm_context_summary_enabled("page_summary", llm_summary_config),
+            "attempted": 0,
+            "used": 0,
+            "failed": 0,
+            "fallback_used": False,
+            "last_error": None,
+        },
+        "likely_context": {
+            "enabled": llm_context_summary_enabled("likely_context", llm_summary_config),
+            "attempted": False,
+            "used": False,
+            "fallback_used": False,
+            "error": None,
+        },
+        "concise_overview": {
+            "enabled": llm_context_summary_enabled("concise_overview", llm_summary_config),
+            "attempted": False,
+            "used": False,
+            "fallback_used": False,
+            "error": None,
+        },
+    }
+
+
+def update_llm_summary_debug(
+    llm_summary_debug: Optional[Dict[str, Any]],
+    scope: str,
+    *,
+    attempted: bool = False,
+    used: bool = False,
+    error: Optional[str] = None,
+) -> None:
+    """Record safe LLM summary status without exposing hidden model reasoning."""
+
+    if not isinstance(llm_summary_debug, dict):
+        return
+    scope_debug = llm_summary_debug.get(scope)
+    if not isinstance(scope_debug, dict):
+        return
+
+    if scope == "page_summary":
+        if attempted:
+            scope_debug["attempted"] = int(scope_debug.get("attempted", 0)) + 1
+        if used:
+            scope_debug["used"] = int(scope_debug.get("used", 0)) + 1
+        if error:
+            scope_debug["failed"] = int(scope_debug.get("failed", 0)) + 1
+            scope_debug["fallback_used"] = True
+            scope_debug["last_error"] = error
+        return
+
+    if attempted:
+        scope_debug["attempted"] = True
+    if used:
+        scope_debug["used"] = True
+    if error:
+        scope_debug["error"] = error
+        scope_debug["fallback_used"] = True
+
+
+def summary_response_text(response_json: Dict[str, Any]) -> str:
+    """Extract plain text from an OpenRouter summary response."""
+
+    choices = response_json.get("choices", [])
+    if not isinstance(choices, list):
+        return ""
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message", {})
+        if not isinstance(message, dict):
+            continue
+        text = extract_text_from_message_content(message.get("content"))
+        if text:
+            return text.strip()
+    return ""
+
+
+def call_openrouter_summary_model(
+    prompt: str,
+    schema: Optional[Dict[str, Any]] = None,
+    llm_summary_config: Optional[LlmSummaryConfig] = None,
+) -> Optional[Any]:
+    """Call the optional OpenRouter summary model with plain-text or schema output."""
+
+    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    if not api_key:
+        return None
+
+    payload: Dict[str, Any] = {
+        "model": llm_summary_model_name(llm_summary_config),
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
+    }
+    if schema is not None:
+        payload["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "summary_output",
+                "strict": True,
+                "schema": schema,
+            },
+        }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": os.getenv("OPENROUTER_HTTP_REFERER", "https://localhost"),
+        "X-Title": os.getenv("OPENROUTER_APP_TITLE", "retrieve_image_background"),
+    }
+    endpoint = os.getenv("OPENROUTER_BASE_URL", OPENROUTER_CHAT_COMPLETIONS_ENDPOINT).rstrip("/")
+    response = requests.post(
+        endpoint,
+        headers=headers,
+        json=payload,
+        timeout=llm_summary_timeout_seconds(llm_summary_config),
+    )
+    response.raise_for_status()
+    response_json = response.json()
+
+    if schema is not None:
+        return parse_openrouter_output_json(response_json)
+    text = summary_response_text(response_json)
+    if not text:
+        raise ValueError("Summary model returned no text.")
+    return text
 
 
 def evidence_schema() -> Dict[str, Any]:
@@ -1095,6 +1379,8 @@ def verify_candidate_pages(
     loaded_image: LoadedImage,
     evidence: ImageEvidence,
     candidates: Sequence[CandidateSource],
+    llm_summary_debug: Optional[Dict[str, Any]] = None,
+    llm_summary_config: Optional[LlmSummaryConfig] = None,
 ) -> List[CandidateSource]:
     """
     Stage 4: verify whether a candidate page actually embeds the same or a near-identical image.
@@ -1117,6 +1403,13 @@ def verify_candidate_pages(
         page_title, page_text, image_urls, published_date = page_data
         candidate.page_title = page_title
         candidate.page_summary_text = extract_best_article_excerpt(page_text, evidence)
+        candidate.page_summary_text = maybe_llm_rewrite_page_summary(
+            candidate,
+            evidence,
+            candidate.page_summary_text,
+            llm_summary_debug=llm_summary_debug,
+            llm_summary_config=llm_summary_config,
+        )
         candidate.published_date = published_date
 
         best_similarity = 0.0
@@ -1327,6 +1620,8 @@ def build_output_json(
     source_decision: Dict[str, Any],
     search_queries: Sequence[str],
     reverse_search_debug: Dict[str, Any],
+    llm_summary_debug: Optional[Dict[str, Any]] = None,
+    llm_summary_config: Optional[LlmSummaryConfig] = None,
 ) -> Dict[str, Any]:
     """
     Stage 5: assemble the final grounded JSON output.
@@ -1336,8 +1631,21 @@ def build_output_json(
     """
 
     winning_candidate = source_decision.get("candidate")
-    likely_context = build_likely_context(evidence, candidates, source_decision)
-    concise_overview = build_concise_overview(evidence, candidates, source_decision, likely_context)
+    likely_context = build_likely_context(
+        evidence,
+        candidates,
+        source_decision,
+        llm_summary_debug=llm_summary_debug,
+        llm_summary_config=llm_summary_config,
+    )
+    concise_overview = build_concise_overview(
+        evidence,
+        candidates,
+        source_decision,
+        likely_context,
+        llm_summary_debug=llm_summary_debug,
+        llm_summary_config=llm_summary_config,
+    )
 
     source_status = source_decision["status"]
     if source_status == "exact_source_found":
@@ -1396,6 +1704,7 @@ def build_output_json(
             "generated_queries": list(search_queries),
             "ocr": evidence.ocr_debug,
             "reverse_image_search": reverse_search_debug,
+            "llm_summary": llm_summary_debug or initialize_llm_summary_debug(llm_summary_config),
             "reasoning_notes": dedupe_join(
                 evidence.extraction_notes
                 + [source_assessment]
@@ -1403,6 +1712,282 @@ def build_output_json(
             ),
         },
     }
+
+
+def compact_evidence_for_summary(evidence: ImageEvidence) -> Dict[str, Any]:
+    """Return a compact grounded evidence payload for optional summary prompts."""
+
+    return {
+        "visual_description": trim_to_complete_sentences(evidence.visual_description, max_chars=220, max_sentences=2),
+        "likely_title": clean_string(evidence.likely_title),
+        "chart_figure_type": clean_string(evidence.chart_figure_type),
+        "axes_labels": dedupe_preserve_order(clean_string_list(evidence.axes_labels))[:3],
+        "key_entities": dedupe_preserve_order(clean_string_list(evidence.key_entities))[:5],
+        "visible_text": dedupe_preserve_order(clean_string_list(evidence.visible_text))[:4],
+        "legend_items": dedupe_preserve_order(clean_string_list(evidence.legend_items))[:4],
+        "units": dedupe_preserve_order(clean_string_list(evidence.units))[:3],
+        "numbers_percentages_dates": dedupe_preserve_order(clean_string_list(evidence.numbers_percentages_dates))[:4],
+        "branding": dedupe_preserve_order(clean_string_list(evidence.logos_watermarks_branding))[:3],
+    }
+
+
+def compact_candidate_for_summary(candidate: CandidateSource) -> Dict[str, Any]:
+    """Return compact grounded candidate fields for optional summary prompts."""
+
+    return {
+        "title": trim_to_complete_sentences(candidate.title, max_chars=180, max_sentences=1),
+        "snippet": trim_to_complete_sentences(strip_boilerplate_text(candidate.snippet), max_chars=220, max_sentences=2),
+        "page_title": trim_to_complete_sentences(candidate.page_title, max_chars=180, max_sentences=1),
+        "page_summary_text": trim_to_complete_sentences(
+            strip_boilerplate_text(candidate.page_summary_text),
+            max_chars=260,
+            max_sentences=2,
+        ),
+        "result_role": candidate.result_role,
+        "image_embedded": bool(candidate.image_embedded),
+        "text_overlap": float(candidate.text_overlap),
+    }
+
+
+def compact_candidates_for_summary(
+    candidates: Sequence[CandidateSource],
+    limit: int = 2,
+) -> List[Dict[str, Any]]:
+    """Return compact grounded candidate summaries for prompt inputs."""
+
+    compact: List[Dict[str, Any]] = []
+    for candidate in candidates[:limit]:
+        item = compact_candidate_for_summary(candidate)
+        if any(item.get(key) for key in ("title", "snippet", "page_title", "page_summary_text")):
+            compact.append(item)
+    return compact
+
+
+def make_json_safe(value: Any) -> Any:
+    """Convert prompt payloads into stdlib-JSON-safe primitive types."""
+
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): make_json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [make_json_safe(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    item_method = getattr(value, "item", None)
+    if callable(item_method):
+        try:
+            return make_json_safe(item_method())
+        except Exception:  # noqa: BLE001
+            pass
+    return clean_string(str(value))
+
+
+def sanitize_llm_single_text(text: str, max_chars: int, max_sentences: int) -> str:
+    """Normalize plain-text model output into a compact grounded summary block."""
+
+    cleaned = clean_string(text.replace("\n", " "))
+    cleaned = re.sub(r"^\s*[-*]\s*", "", cleaned)
+    return trim_to_complete_sentences(cleaned, max_chars=max_chars, max_sentences=max_sentences)
+
+
+def sanitize_llm_multiline_text(text: str, max_lines: int = 6) -> str:
+    """Normalize multiline model output into short explanatory lines."""
+
+    lines: List[str] = []
+    for raw_line in text.splitlines():
+        line = clean_string(re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", raw_line))
+        if not line:
+            continue
+        cleaned = trim_to_complete_sentences(line, max_chars=320, max_sentences=2)
+        if cleaned and cleaned not in lines:
+            lines.append(cleaned)
+        if len(lines) == max_lines:
+            break
+    if lines:
+        return "\n".join(lines)
+    return trim_to_complete_sentences(clean_string(text), max_chars=420, max_sentences=4)
+
+
+def build_page_summary_llm_prompt(
+    candidate: CandidateSource,
+    evidence: ImageEvidence,
+    cleaned_excerpt: str,
+) -> str:
+    """Build the grounded rewrite prompt for a short page-summary excerpt."""
+
+    prompt_payload = make_json_safe({
+        "image_evidence": compact_evidence_for_summary(evidence),
+        "candidate": {
+            "title": candidate.title,
+            "snippet": candidate.snippet,
+            "page_title": candidate.page_title,
+            "cleaned_excerpt": cleaned_excerpt,
+        },
+    })
+    return (
+        "Rewrite the cleaned candidate-page excerpt into a short grounded article-style summary.\n"
+        "Use only the provided evidence.\n"
+        "Rules:\n"
+        "- Do not invent source names, communities, trends, or details.\n"
+        "- Do not add source-verification claims.\n"
+        "- Do not quote or paste long excerpts.\n"
+        "- Avoid boilerplate, ellipses, and unfinished fragments.\n"
+        "- Return plain text only.\n"
+        "- Write 1 to 2 complete sentences.\n"
+        f"Evidence:\n{json.dumps(prompt_payload, ensure_ascii=False, indent=2)}"
+    )
+
+
+def build_likely_context_llm_prompt(
+    evidence: ImageEvidence,
+    candidates: Sequence[CandidateSource],
+    source_decision: Dict[str, Any],
+    deterministic_context: str,
+) -> str:
+    """Build the grounded prompt for optional likely-context synthesis."""
+
+    prompt_payload = make_json_safe({
+        "image_evidence": compact_evidence_for_summary(evidence),
+        "grounded_candidates": compact_candidates_for_summary(candidates, limit=2),
+        "source_status": source_decision["status"],
+        "source_match_type": source_decision["match_type"],
+        "deterministic_context_reference": deterministic_context,
+    })
+    return (
+        "Write one grounded contextual paragraph about what the image likely represents.\n"
+        "Use only the provided evidence.\n"
+        "Rules:\n"
+        "- Explain what the image appears to show and what it is trying to communicate when supported.\n"
+        "- Mention axes, categories, or discussion setting only when supported by the provided evidence.\n"
+        "- Do not invent chart names, communities, rankings, or source claims.\n"
+        "- Do not change or embellish source verification.\n"
+        "- If evidence is weak, stay general.\n"
+        "- Use complete sentences only. No ellipses.\n"
+        "- Return plain text only.\n"
+        f"Evidence:\n{json.dumps(prompt_payload, ensure_ascii=False, indent=2)}"
+    )
+
+
+def build_concise_overview_llm_prompt(
+    evidence: ImageEvidence,
+    candidates: Sequence[CandidateSource],
+    source_decision: Dict[str, Any],
+    deterministic_overview: str,
+) -> str:
+    """Build the grounded prompt for the explanatory concise-overview block."""
+
+    prompt_payload = make_json_safe({
+        "image_evidence": compact_evidence_for_summary(evidence),
+        "grounded_candidates": compact_candidates_for_summary(candidates, limit=2),
+        "source_status": source_decision["status"],
+        "source_match_type": source_decision["match_type"],
+        "deterministic_overview_reference": deterministic_overview,
+    })
+    return (
+        "Write a grounded explanatory summary of the image itself.\n"
+        "Use only the provided evidence.\n"
+        "Rules:\n"
+        "- Start by explaining clearly what the image shows.\n"
+        "- When supported, include chart focus, axes, rankings, trends, categories, data types, or main takeaway.\n"
+        "- Add a source-status caveat only when relevant to the provided source status.\n"
+        "- Avoid repeating raw excerpt text and avoid overclaiming source or originality.\n"
+        "- Do not invent chart names, categories, or trends that are not supported.\n"
+        "- Use complete sentences only. No ellipses.\n"
+        "- Return either one compact paragraph or 3 to 6 short lines separated by newline characters.\n"
+        f"Evidence:\n{json.dumps(prompt_payload, ensure_ascii=False, indent=2)}"
+    )
+
+
+def maybe_llm_rewrite_page_summary(
+    candidate: CandidateSource,
+    evidence: ImageEvidence,
+    deterministic_summary: str,
+    llm_summary_debug: Optional[Dict[str, Any]] = None,
+    llm_summary_config: Optional[LlmSummaryConfig] = None,
+) -> str:
+    """Optionally rewrite a cleaned page summary while preserving deterministic fallback."""
+
+    if not deterministic_summary or not llm_context_summary_enabled("page_summary", llm_summary_config):
+        return deterministic_summary
+
+    try:
+        update_llm_summary_debug(llm_summary_debug, "page_summary", attempted=True)
+        prompt = build_page_summary_llm_prompt(candidate, evidence, deterministic_summary)
+        rewritten = call_openrouter_summary_model(prompt, llm_summary_config=llm_summary_config)
+        if not isinstance(rewritten, str):
+            update_llm_summary_debug(llm_summary_debug, "page_summary", error="Unusable summary-model response.")
+            return deterministic_summary
+        cleaned = sanitize_llm_single_text(rewritten, max_chars=320, max_sentences=2)
+        if cleaned:
+            update_llm_summary_debug(llm_summary_debug, "page_summary", used=True)
+            return cleaned
+        update_llm_summary_debug(llm_summary_debug, "page_summary", error="Empty summary-model rewrite after sanitization.")
+    except Exception as exc:  # noqa: BLE001
+        error_message = format_exception(exc)
+        update_llm_summary_debug(llm_summary_debug, "page_summary", error=error_message)
+        LOGGER.warning("Optional LLM page-summary rewrite failed: %s", error_message)
+    return deterministic_summary
+
+
+def maybe_llm_generate_likely_context(
+    evidence: ImageEvidence,
+    candidates: Sequence[CandidateSource],
+    source_decision: Dict[str, Any],
+    deterministic_context: str,
+    llm_summary_debug: Optional[Dict[str, Any]] = None,
+    llm_summary_config: Optional[LlmSummaryConfig] = None,
+) -> str:
+    """Optionally generate a smoother likely-context paragraph."""
+
+    if not llm_context_summary_enabled("likely_context", llm_summary_config):
+        return deterministic_context
+
+    try:
+        update_llm_summary_debug(llm_summary_debug, "likely_context", attempted=True)
+        prompt = build_likely_context_llm_prompt(evidence, candidates, source_decision, deterministic_context)
+        rewritten = call_openrouter_summary_model(prompt, llm_summary_config=llm_summary_config)
+        if isinstance(rewritten, str):
+            cleaned = sanitize_llm_single_text(rewritten, max_chars=760, max_sentences=4)
+            if cleaned:
+                update_llm_summary_debug(llm_summary_debug, "likely_context", used=True)
+                return cleaned
+        update_llm_summary_debug(llm_summary_debug, "likely_context", error="Empty summary-model likely-context rewrite.")
+    except Exception as exc:  # noqa: BLE001
+        error_message = format_exception(exc)
+        update_llm_summary_debug(llm_summary_debug, "likely_context", error=error_message)
+        LOGGER.warning("Optional LLM likely-context rewrite failed: %s", error_message)
+    return deterministic_context
+
+
+def maybe_llm_generate_concise_overview(
+    evidence: ImageEvidence,
+    candidates: Sequence[CandidateSource],
+    source_decision: Dict[str, Any],
+    deterministic_overview: str,
+    llm_summary_debug: Optional[Dict[str, Any]] = None,
+    llm_summary_config: Optional[LlmSummaryConfig] = None,
+) -> str:
+    """Optionally generate a smoother explanatory concise-overview block."""
+
+    if not llm_context_summary_enabled("concise_overview", llm_summary_config):
+        return deterministic_overview
+
+    try:
+        update_llm_summary_debug(llm_summary_debug, "concise_overview", attempted=True)
+        prompt = build_concise_overview_llm_prompt(evidence, candidates, source_decision, deterministic_overview)
+        rewritten = call_openrouter_summary_model(prompt, llm_summary_config=llm_summary_config)
+        if isinstance(rewritten, str):
+            cleaned = sanitize_llm_multiline_text(rewritten, max_lines=6)
+            if cleaned:
+                update_llm_summary_debug(llm_summary_debug, "concise_overview", used=True)
+                return cleaned
+        update_llm_summary_debug(llm_summary_debug, "concise_overview", error="Empty summary-model concise-overview rewrite.")
+    except Exception as exc:  # noqa: BLE001
+        error_message = format_exception(exc)
+        update_llm_summary_debug(llm_summary_debug, "concise_overview", error=error_message)
+        LOGGER.warning("Optional LLM concise-overview rewrite failed: %s", error_message)
+    return deterministic_overview
 
 
 def evidence_context_tokens(values: Sequence[str]) -> Set[str]:
@@ -1658,6 +2243,8 @@ def build_likely_context(
     evidence: ImageEvidence,
     candidates: Sequence[CandidateSource],
     source_decision: Dict[str, Any],
+    llm_summary_debug: Optional[Dict[str, Any]] = None,
+    llm_summary_config: Optional[LlmSummaryConfig] = None,
 ) -> str:
     """Build a richer article-style context paragraph grounded in image and retrieval evidence."""
 
@@ -1675,9 +2262,25 @@ def build_likely_context(
     ) if sentence]
 
     if sentences:
-        return trim_to_complete_sentences(" ".join(sentences[:4]), max_chars=720, max_sentences=4)
-    return trim_to_complete_sentences(
+        deterministic_context = trim_to_complete_sentences(" ".join(sentences[:4]), max_chars=720, max_sentences=4)
+        return maybe_llm_generate_likely_context(
+            evidence,
+            context_candidates,
+            source_decision,
+            deterministic_context,
+            llm_summary_debug=llm_summary_debug,
+            llm_summary_config=llm_summary_config,
+        )
+    deterministic_context = trim_to_complete_sentences(
         f"This likely relates to {summarize_subject(evidence)}, but the available grounded context is limited."
+    )
+    return maybe_llm_generate_likely_context(
+        evidence,
+        context_candidates,
+        source_decision,
+        deterministic_context,
+        llm_summary_debug=llm_summary_debug,
+        llm_summary_config=llm_summary_config,
     )
 
 
@@ -1686,10 +2289,21 @@ def build_concise_overview(
     candidates: Sequence[CandidateSource],
     source_decision: Dict[str, Any],
     likely_context: str,
+    llm_summary_debug: Optional[Dict[str, Any]] = None,
+    llm_summary_config: Optional[LlmSummaryConfig] = None,
 ) -> str:
     """Build a grounded human-readable overview after evidence extraction and candidate verification."""
 
-    return build_grounded_summary(evidence, candidates, source_decision, likely_context)
+    deterministic_overview = build_grounded_summary(evidence, candidates, source_decision, likely_context)
+    context_candidates = select_grounded_context_candidates(candidates, source_decision)
+    return maybe_llm_generate_concise_overview(
+        evidence,
+        context_candidates,
+        source_decision,
+        deterministic_overview,
+        llm_summary_debug=llm_summary_debug,
+        llm_summary_config=llm_summary_config,
+    )
 
 
 def build_grounded_summary(
@@ -2453,6 +3067,65 @@ def truncate_sentence(text: str, limit: int = 220) -> str:
     return trim_to_complete_sentences(text, max_chars=limit, max_sentences=1)
 
 
+def resolve_cli_bool_override(
+    enabled_flag: bool,
+    disabled_flag: bool,
+    setting_name: str,
+) -> Optional[bool]:
+    """Resolve paired CLI enable/disable flags, or raise on conflicts."""
+
+    if enabled_flag and disabled_flag:
+        raise ValueError(f"Conflicting CLI flags for {setting_name}: both enable and disable were provided.")
+    if enabled_flag:
+        return True
+    if disabled_flag:
+        return False
+    return None
+
+
+def build_llm_summary_config_from_args(args: argparse.Namespace) -> Optional[LlmSummaryConfig]:
+    """Build explicit CLI overrides while leaving env as the baseline when omitted."""
+
+    config = LlmSummaryConfig(
+        enable_llm_context_summary=resolve_cli_bool_override(
+            args.enable_llm_summary,
+            args.disable_llm_summary,
+            "LLM summary",
+        ),
+        page_summary_enabled=resolve_cli_bool_override(
+            args.enable_page_summary,
+            args.disable_page_summary,
+            "page summary",
+        ),
+        likely_context_enabled=resolve_cli_bool_override(
+            args.enable_likely_context,
+            args.disable_likely_context,
+            "likely context",
+        ),
+        concise_overview_enabled=resolve_cli_bool_override(
+            args.enable_concise_overview,
+            args.disable_concise_overview,
+            "concise overview",
+        ),
+        summary_model=args.llm_summary_model.strip() if args.llm_summary_model else None,
+        timeout_seconds=args.llm_summary_timeout,
+    )
+
+    if all(
+        value is None
+        for value in (
+            config.enable_llm_context_summary,
+            config.page_summary_enabled,
+            config.likely_context_enabled,
+            config.concise_overview_enabled,
+            config.summary_model,
+            config.timeout_seconds,
+        )
+    ):
+        return None
+    return config
+
+
 def main() -> None:
     """CLI entrypoint for local runs or agent pipelines."""
 
@@ -2465,9 +3138,24 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Retrieve grounded background and source evidence for an image.")
     parser.add_argument("--image", required=True, help="Image input as URL, data URL, base64, or local path.")
     parser.add_argument("--user-query", default="", help="Optional user question about the image.")
+    parser.add_argument("--enable-llm-summary", action="store_true", help="Enable optional LLM-assisted summary rewriting.")
+    parser.add_argument("--disable-llm-summary", action="store_true", help="Disable optional LLM-assisted summary rewriting.")
+    parser.add_argument("--enable-page-summary", action="store_true", help="Enable LLM rewriting for candidate page summaries.")
+    parser.add_argument("--disable-page-summary", action="store_true", help="Disable LLM rewriting for candidate page summaries.")
+    parser.add_argument("--enable-likely-context", action="store_true", help="Enable LLM rewriting for likely_context.")
+    parser.add_argument("--disable-likely-context", action="store_true", help="Disable LLM rewriting for likely_context.")
+    parser.add_argument("--enable-concise-overview", action="store_true", help="Enable LLM rewriting for concise_overview.")
+    parser.add_argument("--disable-concise-overview", action="store_true", help="Disable LLM rewriting for concise_overview.")
+    parser.add_argument("--llm-summary-model", help="Override the OpenRouter model used for optional summary rewrites.")
+    parser.add_argument("--llm-summary-timeout", type=int, help="Override the timeout in seconds for optional summary rewrites.")
     args = parser.parse_args()
 
-    result = retrieve_image_background(args.image, args.user_query)
+    try:
+        llm_summary_config = build_llm_summary_config_from_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    result = retrieve_image_background(args.image, args.user_query, llm_summary_config=llm_summary_config)
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
