@@ -10,15 +10,25 @@
   - Stage 3: OCR-based web search
   - Stage 4: source verification through embedded-image visual matching
   - Stage 5: grounded JSON output assembly
+- Uses deterministic evidence cleaning and summary generation by default.
+- Can optionally apply an OpenRouter-based LLM rewrite layer on top of the deterministic summaries for:
+  - `candidate.page_summary_text`
+  - `likely_context`
+  - `concise_overview`
 - Uses a strict rule that a source page must contain the same or a near-identical embedded image; text-only similarity is not enough.
 - Returns `source_not_found` when no visually verified source is found.
 - Preserves raw reverse-image candidates in the JSON output even when Stage 4 cannot verify a page-level embedded image match.
 - Exposes structured `debug_info.reverse_image_search` details for skipped reverse-search attempts and GCS signed-URL failures.
+- Exposes structured `debug_info.llm_summary` details for optional summary rewrite usage, fallback, and model configuration.
 - Optional environment variables:
   - `OPENROUTER_API_KEY` for vision-based evidence extraction through OpenRouter
   - `SERPAPI_API_KEY` for reverse image search through SerpApi Google Lens
   - `BRAVE_SEARCH_API_KEY` for OCR-based web search through Brave Search
   - `GOOGLE_CLOUD_PROJECT`, `TEMP_IMAGE_BUCKET`, and `GOOGLE_APPLICATION_CREDENTIALS` for temporary GCS uploads and signed URLs when reverse-searching local, base64, or `data:` images
+  - `ENABLE_LLM_CONTEXT_SUMMARY` to enable optional LLM summary rewriting
+  - `OPENROUTER_SUMMARY_MODEL` to override the summary rewrite model
+  - `LLM_SUMMARY_TIMEOUT_SECONDS` to override summary request timeout
+  - `LLM_PAGE_SUMMARY_ENABLED`, `LLM_LIKELY_CONTEXT_ENABLED`, `LLM_CONCISE_OVERVIEW_ENABLED` to scope the optional LLM rewrite layer
 - If you run the pipeline with a local image, base64 image, or `data:` URL, you must configure GCS. The pipeline uploads the image to a private bucket, creates a signed URL, uses that signed URL for SerpApi Google Lens, and then deletes the uploaded object.
 - For local-image reverse search, create a service account in the Google Cloud project, create a JSON key for that service account, download it locally, and export it with `export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account-key.json"`.
 - ADC is used for Google Cloud access through `google-cloud-storage`; no separate GCS API key is required.
@@ -29,6 +39,18 @@
   - on Windows: install Tesseract OCR and ensure the executable is on `PATH`
 - Install Python dependencies as needed, including `pip install google-cloud-storage`.
 - Run: `python retrieve_image_background.py --image <url|data-url|base64|local-path>`
+- Optional CLI overrides:
+  - `--enable-llm-summary` / `--disable-llm-summary`
+  - `--enable-page-summary` / `--disable-page-summary`
+  - `--enable-likely-context` / `--disable-likely-context`
+  - `--enable-concise-overview` / `--disable-concise-overview`
+  - `--llm-summary-model <model>`
+  - `--llm-summary-timeout <seconds>`
+- Config precedence for the optional summary rewrite layer:
+  - explicit CLI override or function-call config
+  - environment variable
+  - hardcoded default
+- Python callers can pass `llm_summary_config=LlmSummaryConfig(...)` into `retrieve_image_background(...)` for the same overrides without relying on CLI flags.
 - Detailed design and limitations: `RETRIEVE_IMAGE_BACKGROUND_PIPELINE.md`
 
 ### `reddit_scraper.py`
