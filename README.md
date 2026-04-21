@@ -53,6 +53,43 @@
 - Python callers can pass `llm_summary_config=LlmSummaryConfig(...)` into `retrieve_image_background(...)` for the same overrides without relying on CLI flags.
 - Detailed design and limitations: `RETRIEVE_IMAGE_BACKGROUND_PIPELINE.md`
 
+### `retrieve_pipeline_test.py`
+
+- Batch-runs `retrieve_image_background.py` on one local image or a folder of local test images.
+- Saves full JSON outputs to `test_json_output` by default and markdown comparison files to `test_md_output` by default.
+- Discovers image files with `.png`, `.jpg`, `.jpeg`, or `.webp` extensions and expects filenames to start with a numeric image index such as `001009_example.jpg`.
+- Runs four fixed comparison variants for each selected image:
+  - `det`: deterministic page summaries plus deterministic `likely_context` and `concise_overview`
+  - `llm-page-summary`: LLM page-summary rewrite only, with deterministic final `likely_context` and `concise_overview`
+  - `llm-all`: LLM page-summary rewrite plus LLM final `likely_context` and `concise_overview`
+  - `llm-final-no-page`: deterministic page summaries with LLM final `likely_context` and `concise_overview`
+- This variant set is intended to isolate how page-summary rewriting affects deterministic and LLM final summary generation.
+- The script records failures as JSON payloads instead of aborting the whole batch.
+- Run a folder:
+
+```bash
+python retrieve_pipeline_test.py --input-path reddit/mis_fig --limit 5
+```
+
+- Run one image by numeric index:
+
+```bash
+python retrieve_pipeline_test.py --input-path reddit/mis_fig --image-index 1009
+```
+
+- Run one explicit file:
+
+```bash
+python retrieve_pipeline_test.py --input-path reddit/mis_fig/001009_example.jpg
+```
+
+- Optional output overrides:
+  - `--json-output-dir <dir>`
+  - `--md-output-dir <dir>`
+- Optional shared query:
+  - `--user-query "Find the original source page for this image."`
+- For local-image reverse search, the same GCS, SerpApi, Brave, OCR, and OpenRouter setup requirements from `retrieve_image_background.py` apply.
+
 ### `reddit_scraper.py`
 
 - Scrapes `r/dataisugly` via Reddit’s public JSON endpoints (no API keys), iterating multiple sorts/time windows: `new`, `hot`, `rising`, `best`, `top` (`day/week/month/year/all`), and `controversial` (`day/week/month/year/all`).
