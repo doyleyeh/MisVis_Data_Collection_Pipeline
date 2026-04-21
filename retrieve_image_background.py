@@ -239,6 +239,8 @@ class CandidateSource:
     text_overlap: float = 0.0
     page_title: str = ""
     page_summary_text: str = ""
+    deterministic_page_summary_text: str = ""
+    llm_page_summary_text: str = ""
 
 
 @dataclass
@@ -372,10 +374,15 @@ def retrieve_image_background(
         loaded_image,
         evidence,
         combined_candidates,
+    )
+    source_decision = determine_source_decision(verified_candidates, reverse_candidates)
+    apply_post_decision_page_summary_rewrites(
+        evidence,
+        verified_candidates,
+        source_decision,
         llm_summary_debug=llm_summary_debug,
         llm_summary_config=llm_summary_config,
     )
-    source_decision = determine_source_decision(verified_candidates, reverse_candidates)
 
     return build_output_json(
         evidence=evidence,
@@ -718,6 +725,10 @@ def initialize_llm_summary_debug(llm_summary_config: Optional[LlmSummaryConfig] 
             "failed": 0,
             "fallback_used": False,
             "last_error": None,
+            "post_decision_rewrites": {
+                "selected_count": 0,
+                "candidates": [],
+            },
         },
         "likely_context": {
             "enabled": llm_context_summary_enabled("likely_context", llm_summary_config),
@@ -770,6 +781,75 @@ def update_llm_summary_debug(
     if error:
         scope_debug["error"] = error
         scope_debug["fallback_used"] = True
+
+
+def page_summary_debug_scope(llm_summary_debug: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Return the page-summary debug object when available."""
+
+    if not isinstance(llm_summary_debug, dict):
+        return None
+    scope_debug = llm_summary_debug.get("page_summary")
+    if not isinstance(scope_debug, dict):
+        return None
+    return scope_debug
+
+
+def page_summary_rewrite_counts(scope_debug: Optional[Dict[str, Any]]) -> Dict[str, int]:
+    """Capture current page-summary rewrite counters for delta-based debug records."""
+
+    if not isinstance(scope_debug, dict):
+        return {"attempted": 0, "used": 0, "failed": 0}
+    return {
+        "attempted": int(scope_debug.get("attempted", 0)),
+        "used": int(scope_debug.get("used", 0)),
+        "failed": int(scope_debug.get("failed", 0)),
+    }
+
+
+def record_post_decision_page_summary_rewrite(
+    llm_summary_debug: Optional[Dict[str, Any]],
+    candidate: CandidateSource,
+    *,
+    deterministic_summary_present: bool,
+    attempted: bool = False,
+    used: bool = False,
+    changed: bool = False,
+    fallback_used: bool = False,
+    skipped_reason: Optional[str] = None,
+) -> None:
+    """Record which candidate page summaries were rewritten after source decision."""
+
+    scope_debug = page_summary_debug_scope(llm_summary_debug)
+    if scope_debug is None:
+        return
+    rewrite_debug = scope_debug.setdefault(
+        "post_decision_rewrites",
+        {
+            "selected_count": 0,
+            "candidates": [],
+        },
+    )
+    if not isinstance(rewrite_debug, dict):
+        return
+    records = rewrite_debug.setdefault("candidates", [])
+    if not isinstance(records, list):
+        return
+    records.append(
+        {
+            "url": candidate.url,
+            "title": candidate_headline(candidate) or candidate.title,
+            "source_candidate": candidate.evidence_type,
+            "image_embedded": bool(candidate.image_embedded),
+            "best_image_similarity": float(candidate.best_image_similarity),
+            "text_overlap": float(candidate.text_overlap),
+            "deterministic_summary_present": deterministic_summary_present,
+            "attempted": attempted,
+            "used": used,
+            "changed_text": changed,
+            "fallback_used": fallback_used,
+            "skipped_reason": skipped_reason,
+        }
+    )
 
 
 def summary_response_text(response_json: Dict[str, Any]) -> str:
@@ -1379,8 +1459,6 @@ def verify_candidate_pages(
     loaded_image: LoadedImage,
     evidence: ImageEvidence,
     candidates: Sequence[CandidateSource],
-    llm_summary_debug: Optional[Dict[str, Any]] = None,
-    llm_summary_config: Optional[LlmSummaryConfig] = None,
 ) -> List[CandidateSource]:
     """
     Stage 4: verify whether a candidate page actually embeds the same or a near-identical image.
@@ -1403,13 +1481,7 @@ def verify_candidate_pages(
         page_title, page_text, image_urls, published_date = page_data
         candidate.page_title = page_title
         candidate.page_summary_text = extract_best_article_excerpt(page_text, evidence)
-        candidate.page_summary_text = maybe_llm_rewrite_page_summary(
-            candidate,
-            evidence,
-            candidate.page_summary_text,
-            llm_summary_debug=llm_summary_debug,
-            llm_summary_config=llm_summary_config,
-        )
+        candidate.deterministic_page_summary_text = candidate.page_summary_text
         candidate.published_date = published_date
 
         best_similarity = 0.0
@@ -1613,6 +1685,88 @@ def determine_source_decision(
     }
 
 
+def apply_post_decision_page_summary_rewrites(
+    evidence: ImageEvidence,
+    candidates: Sequence[CandidateSource],
+    source_decision: Dict[str, Any],
+    llm_summary_debug: Optional[Dict[str, Any]] = None,
+    llm_summary_config: Optional[LlmSummaryConfig] = None,
+) -> None:
+    """Rewrite page summaries only after source verification has already been decided."""
+
+    if not llm_context_summary_enabled("page_summary", llm_summary_config):
+        return
+
+    context_candidates = select_grounded_context_candidates(candidates, source_decision)
+    scope_debug = page_summary_debug_scope(llm_summary_debug)
+    if scope_debug is not None:
+        rewrite_debug = scope_debug.setdefault(
+            "post_decision_rewrites",
+            {
+                "selected_count": 0,
+                "candidates": [],
+            },
+        )
+        if isinstance(rewrite_debug, dict):
+            rewrite_debug["selected_count"] = len(context_candidates)
+
+    seen_urls: Set[str] = set()
+    for candidate in context_candidates:
+        normalized_url = normalize_url(candidate.url)
+        if normalized_url in seen_urls:
+            record_post_decision_page_summary_rewrite(
+                llm_summary_debug,
+                candidate,
+                deterministic_summary_present=bool(
+                    candidate.deterministic_page_summary_text
+                    or candidate.page_summary_text
+                ),
+                skipped_reason="duplicate_candidate_url",
+            )
+            continue
+        seen_urls.add(normalized_url)
+
+        deterministic_summary = (
+            candidate.deterministic_page_summary_text
+            or candidate.page_summary_text
+        )
+        if not deterministic_summary:
+            record_post_decision_page_summary_rewrite(
+                llm_summary_debug,
+                candidate,
+                deterministic_summary_present=False,
+                skipped_reason="missing_deterministic_summary",
+            )
+            continue
+
+        before_counts = page_summary_rewrite_counts(scope_debug)
+        rewritten = maybe_llm_rewrite_page_summary(
+            candidate,
+            evidence,
+            deterministic_summary,
+            llm_summary_debug=llm_summary_debug,
+            llm_summary_config=llm_summary_config,
+        )
+        after_counts = page_summary_rewrite_counts(scope_debug)
+        attempted = after_counts["attempted"] > before_counts["attempted"]
+        used = after_counts["used"] > before_counts["used"]
+        failed = after_counts["failed"] > before_counts["failed"]
+        changed = bool(rewritten and rewritten != deterministic_summary)
+        candidate.page_summary_text = rewritten
+        if changed:
+            candidate.llm_page_summary_text = rewritten
+        record_post_decision_page_summary_rewrite(
+            llm_summary_debug,
+            candidate,
+            deterministic_summary_present=True,
+            attempted=attempted,
+            used=used,
+            changed=changed,
+            fallback_used=failed or not used,
+            skipped_reason=None,
+        )
+
+
 def build_output_json(
     evidence: ImageEvidence,
     candidates: Sequence[CandidateSource],
@@ -1734,12 +1888,26 @@ def compact_evidence_for_summary(evidence: ImageEvidence) -> Dict[str, Any]:
 def compact_candidate_for_summary(candidate: CandidateSource) -> Dict[str, Any]:
     """Return compact grounded candidate fields for optional summary prompts."""
 
+    deterministic_summary = (
+        candidate.deterministic_page_summary_text
+        or candidate.page_summary_text
+    )
     return {
         "title": trim_to_complete_sentences(candidate.title, max_chars=180, max_sentences=1),
         "snippet": trim_to_complete_sentences(strip_boilerplate_text(candidate.snippet), max_chars=220, max_sentences=2),
         "page_title": trim_to_complete_sentences(candidate.page_title, max_chars=180, max_sentences=1),
         "page_summary_text": trim_to_complete_sentences(
             strip_boilerplate_text(candidate.page_summary_text),
+            max_chars=260,
+            max_sentences=2,
+        ),
+        "deterministic_page_summary_text": trim_to_complete_sentences(
+            strip_boilerplate_text(deterministic_summary),
+            max_chars=320,
+            max_sentences=2,
+        ),
+        "llm_page_summary_text": trim_to_complete_sentences(
+            strip_boilerplate_text(candidate.llm_page_summary_text),
             max_chars=260,
             max_sentences=2,
         ),
@@ -1758,7 +1926,17 @@ def compact_candidates_for_summary(
     compact: List[Dict[str, Any]] = []
     for candidate in candidates[:limit]:
         item = compact_candidate_for_summary(candidate)
-        if any(item.get(key) for key in ("title", "snippet", "page_title", "page_summary_text")):
+        if any(
+            item.get(key)
+            for key in (
+                "title",
+                "snippet",
+                "page_title",
+                "page_summary_text",
+                "deterministic_page_summary_text",
+                "llm_page_summary_text",
+            )
+        ):
             compact.append(item)
     return compact
 
@@ -1860,6 +2038,8 @@ def build_likely_context_llm_prompt(
         "Rules:\n"
         "- Explain what the image appears to show and what it is trying to communicate when supported.\n"
         "- Mention axes, categories, or discussion setting only when supported by the provided evidence.\n"
+        "- Treat deterministic_page_summary_text as the detail-preserving page evidence when present.\n"
+        "- Treat llm_page_summary_text only as a smoother rewrite of that page evidence.\n"
         "- Do not invent chart names, communities, rankings, or source claims.\n"
         "- Do not change or embellish source verification.\n"
         "- If evidence is weak, stay general.\n"
@@ -1890,6 +2070,8 @@ def build_concise_overview_llm_prompt(
         "Rules:\n"
         "- Start by explaining clearly what the image shows.\n"
         "- When supported, include chart focus, axes, rankings, trends, categories, data types, or main takeaway.\n"
+        "- Treat deterministic_page_summary_text as the detail-preserving page evidence when present.\n"
+        "- Treat llm_page_summary_text only as a smoother rewrite of that page evidence.\n"
         "- Add a source-status caveat only when relevant to the provided source status.\n"
         "- Avoid repeating raw excerpt text and avoid overclaiming source or originality.\n"
         "- Do not invent chart names, categories, or trends that are not supported.\n"
@@ -2485,7 +2667,12 @@ def select_grounded_context_candidates(
 def score_candidate_for_context(candidate: CandidateSource) -> float:
     """Rank candidates for summary context without affecting source verification."""
 
-    summary_text = strip_boilerplate_text(candidate.page_summary_text)
+    summary_text = strip_boilerplate_text(
+        dedupe_join([
+            candidate.page_summary_text,
+            candidate.deterministic_page_summary_text,
+        ])
+    )
     snippet = strip_boilerplate_text(candidate.snippet)
     headline = candidate_headline(candidate)
 
@@ -2522,7 +2709,13 @@ def candidate_headline(candidate: CandidateSource) -> str:
 def candidate_context_excerpt(candidate: CandidateSource, limit: int = 240) -> str:
     """Return the strongest contextual text available from a grounded candidate page."""
 
-    for value in (candidate.page_summary_text, candidate.snippet, candidate.page_title, candidate.title):
+    for value in (
+        candidate.page_summary_text,
+        candidate.deterministic_page_summary_text,
+        candidate.snippet,
+        candidate.page_title,
+        candidate.title,
+    ):
         cleaned = strip_boilerplate_text(clean_string(value))
         if cleaned:
             return trim_to_complete_sentences(cleaned, max_chars=limit, max_sentences=2)
@@ -2554,6 +2747,8 @@ def extract_candidate_context_terms(
         candidate.title,
         candidate.snippet,
         candidate.page_summary_text,
+        candidate.deterministic_page_summary_text,
+        candidate.llm_page_summary_text,
     ]
     evidence_tokens = build_evidence_tokens(evidence)
     scores: Dict[str, float] = {}
